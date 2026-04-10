@@ -1,0 +1,26 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Generated PDFs
+*.pdf
+pdf_field_layout/
+
+# IDE / OS
+.claude/
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
