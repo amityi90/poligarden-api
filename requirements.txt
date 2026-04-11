@@ -3,3 +3,4 @@ flask-cors==4.0.1
 supabase==2.4.1
 python-dotenv==1.0.1
 matplotlib==3.9.2
+gunicorn==22.0.0
