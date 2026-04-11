@@ -85,7 +85,7 @@ def _render_pdf(geojson: dict, field_length: float, field_width: float) -> bytes
 
     for feature in features:
         props  = feature["properties"]
-        coords = feature["geometry"]["coordinates"][0]
+        geom   = feature["geometry"]
         ftype  = props.get("type")
 
         if ftype == "plant_instance":
@@ -106,21 +106,37 @@ def _render_pdf(geojson: dict, field_length: float, field_width: float) -> bytes
         else:
             continue
 
-        patch = MplPolygon(
-            coords, closed=True,
-            facecolor=style["fc"],
-            edgecolor=style.get("ec", "none"),
-            linewidth=style.get("lw", 0),
-            alpha=style.get("alpha", 1.0),
-            zorder=zorder,
-        )
-        ax.add_patch(patch)
+        # plant_instance features are Points — draw as a Circle patch
+        if geom["type"] == "Point":
+            cx, cy      = geom["coordinates"]
+            radius_data = props["radius_m"]
+            circle = plt.Circle(
+                (cx, cy), radius_data,
+                facecolor=style["fc"],
+                edgecolor=style.get("ec", "none"),
+                linewidth=style.get("lw", 0),
+                alpha=style.get("alpha", 1.0),
+                zorder=zorder,
+            )
+            ax.add_patch(circle)
+        else:
+            coords = geom["coordinates"][0]
+            patch  = MplPolygon(
+                coords, closed=True,
+                facecolor=style["fc"],
+                edgecolor=style.get("ec", "none"),
+                linewidth=style.get("lw", 0),
+                alpha=style.get("alpha", 1.0),
+                zorder=zorder,
+            )
+            ax.add_patch(patch)
+            if name and color:
+                xs = [c[0] for c in coords]
+                ys = [c[1] for c in coords]
+                cx, cy      = sum(xs) / len(xs), sum(ys) / len(ys)
+                radius_data = (max(xs) - min(xs)) / 2
 
         if name and color:
-            xs = [c[0] for c in coords]
-            ys = [c[1] for c in coords]
-            cx, cy      = sum(xs) / len(xs), sum(ys) / len(ys)
-            radius_data = (max(xs) - min(xs)) / 2
             pending_labels.append((cx, cy, radius_data, name, color, zorder))
 
     # ── legend ────────────────────────────────────────────────────────────────

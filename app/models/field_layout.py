@@ -98,12 +98,17 @@ class FieldLayout:
         
         def add_plant(x, y, plant):
             radius = (plant.spread / 100) / 2
-            self._geometries.append(Point(x + radius, y + radius).buffer(radius, resolution=64))
+            cx = x + radius
+            cy = y + radius
+            # Store as Point — avoids expensive buffer() for thousands of plants.
+            # The UI reads center from geometry + radius_m from properties.
+            self._geometries.append(Point(cx, cy))
             self._properties.append({
                 "type":       "plant_instance",
                 "plant_id":   plant.id,
                 "plant_name": plant.name,
                 "spread_m":   round(plant.spread / 100, 2),
+                "radius_m":   round(radius, 4),
             })
 
 
@@ -408,15 +413,13 @@ class FieldLayout:
         def _place(x: float, y_local: float, plant) -> None:
             size   = plant.spread / 100
             radius = size / 2
-            self._geometries.append(
-                Point(x + radius, y_bottom + y_local + radius)
-                .buffer(radius, resolution=64)
-            )
+            self._geometries.append(Point(x + radius, y_bottom + y_local + radius))
             self._properties.append({
                 "type":       "plant_instance",
                 "plant_id":   plant.id,
                 "plant_name": plant.name,
                 "spread_m":   round(size, 2),
+                "radius_m":   round(radius, 4),
                 "row_index":  row_index,
             })
 
@@ -629,7 +632,7 @@ class FieldLayout:
             tree   = self.trees[tree_index % len(self.trees)]
             radius = (tree.spread / 100) / 2
 
-            self._geometries.append(Point(x, centre_y).buffer(radius, resolution=64))
+            self._geometries.append(Point(x, centre_y).buffer(radius, resolution=16))
             self._properties.append({
                 "type":      "tree",
                 "name":      tree.name,
@@ -775,15 +778,13 @@ class FieldLayout:
             def _place(x: float, y_local: float, plant) -> None:
                 size   = plant.spread / 100
                 radius = size / 2
-                self._geometries.append(
-                    Point(x + radius, row_y_bottom + y_local + radius)
-                    .buffer(radius, resolution=64)
-                )
+                self._geometries.append(Point(x + radius, row_y_bottom + y_local + radius))
                 self._properties.append({
                     "type":       "plant_instance",
                     "plant_id":   plant.id,
                     "plant_name": plant.name,
                     "spread_m":   round(size, 2),
+                    "radius_m":   round(radius, 4),
                     "row_index":  row_index,
                 })
 
@@ -884,13 +885,20 @@ class FieldLayout:
     def to_geojson(self) -> dict:
         features = []
         for geom, props in zip(self._geometries, self._properties):
-            coords = [list(coord) for coord in geom.exterior.coords]
-            features.append({
-                "type": "Feature",
-                "geometry": {
+            if geom.geom_type == "Point":
+                geometry = {
+                    "type":        "Point",
+                    "coordinates": [geom.x, geom.y],
+                }
+            else:
+                coords = [list(coord) for coord in geom.exterior.coords]
+                geometry = {
                     "type":        "Polygon",
                     "coordinates": [coords],
-                },
+                }
+            features.append({
+                "type": "Feature",
+                "geometry": geometry,
                 "properties": props,
             })
         return {"type": "FeatureCollection", "features": features}
