@@ -100,15 +100,11 @@ class FieldLayout:
             radius = (plant.spread / 100) / 2
             self._geometries.append(Point(x + radius, y + radius).buffer(radius, resolution=64))
             self._properties.append({
-                "type":      "tree",
-                "name":      plant.name,
-                "spread_m":  round(plant.spread / 100, 2),
-                "height_m":  round(plant.height / 100, 2),
-                "center_x":  round(x, 4),
-                "center_y":  round(y, 4),
-                "radius_m":  round(radius, 4),
-                })
-            # meta data need to be checed as all metadata
+                "type":       "plant_instance",
+                "plant_id":   plant.id,
+                "plant_name": plant.name,
+                "spread_m":   round(plant.spread / 100, 2),
+            })
 
 
         def fill_rect_gap(start_x, start_y, gap_w, gap_h, fillers: list, y_bottom: float = 0.0):
