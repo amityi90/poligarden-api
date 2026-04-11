@@ -461,14 +461,15 @@ class FieldLayout:
             return col_x + col_w
 
         # ── column packing ───────────────────────────────────────────────────
-        all_placed: list = []
+        col_intervals: list = []   # [(col_x_start, col_x_end), ...]
         filler_idx = 0
         curr_x     = x_start
 
         while curr_x < x_end:
-            col_y     = 0.0
-            col_width = 0.0
+            col_y       = 0.0
+            col_width   = 0.0
             col_plants: list = []
+            col_x_start = curr_x
 
             while col_y < ROW_HEIGHT:
                 plant = flat_plants[filler_idx % len(flat_plants)]
@@ -488,19 +489,14 @@ class FieldLayout:
             if col_width == 0:
                 break   # section too narrow for any plant
 
-            curr_x = _close_col(curr_x, col_y, col_width, col_plants, all_placed)
+            curr_x = _close_col(curr_x, col_y, col_width, col_plants, [])
+            col_intervals.append((col_x_start, curr_x))
 
         # ── fill remaining x-gaps across the section ─────────────────────────
-        if all_placed:
-            intervals = sorted({(px, px + ps) for px, _, ps in all_placed})
-            merged: list = []
-            for s, e in intervals:
-                if merged and s <= merged[-1][1]:
-                    merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-                else:
-                    merged.append([s, e])
+        # Use column intervals so we never re-enter space _close_col already filled.
+        if col_intervals:
             prev = x_start
-            for s, e in merged:
+            for s, e in col_intervals:
                 if s - prev > 1e-6:
                     _fill_rect(prev, 0.0, s - prev, ROW_HEIGHT)
                 prev = e
@@ -831,14 +827,17 @@ class FieldLayout:
                 return col_x + col_w
 
             # ── column-based packing across the gap ──────────────────────────
-            all_plants: list = []   # (x, y_local, size) for every placed plant
+            # Track column x-intervals (not individual plant positions) so the
+            # final x-gap fill does not re-enter space already filled by _close_col.
+            col_intervals: list = []   # [(col_x_start, col_x_end), ...]
             filler_idx = 0
             curr_x     = gap_start
 
             while curr_x < gap_end:
-                col_y     = 0.0
-                col_width = 0.0
+                col_y      = 0.0
+                col_width  = 0.0
                 col_plants: list = []
+                col_x_start = curr_x
 
                 # Fill one column top-to-bottom, cycling through fillers
                 while col_y < ROW_HEIGHT:
@@ -859,19 +858,16 @@ class FieldLayout:
                 if col_width == 0:
                     break   # no plant could fit — gap too narrow
 
-                curr_x = _close_col(curr_x, col_y, col_width, col_plants, all_plants)
+                curr_x = _close_col(curr_x, col_y, col_width, col_plants, [])
+                col_intervals.append((col_x_start, curr_x))
 
             # ── fill remaining x-gaps across the whole tree gap ───────────────
-            if all_plants:
-                intervals = sorted({(px, px + ps) for px, _, ps in all_plants})
-                merged: list = []
-                for s, e in intervals:
-                    if merged and s <= merged[-1][1]:
-                        merged[-1] = (merged[-1][0], max(merged[-1][1], e))
-                    else:
-                        merged.append([s, e])
+            # Use column intervals (not plant positions) — _close_col already
+            # filled the full column width including side-gaps, so only the
+            # spaces BETWEEN columns are truly empty.
+            if col_intervals:
                 prev = gap_start
-                for s, e in merged:
+                for s, e in col_intervals:
                     if s - prev > 1e-6:
                         _fill_rect(prev, 0.0, s - prev, ROW_HEIGHT)
                     prev = e
