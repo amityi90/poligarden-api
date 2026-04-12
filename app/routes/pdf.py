@@ -6,6 +6,7 @@ matplotlib.use("Agg")          # non-interactive backend — safe for servers
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.patches import Polygon as MplPolygon
+from matplotlib.collections import EllipseCollection
 
 from flask import Blueprint, request, jsonify, send_file
 
@@ -58,6 +59,8 @@ def _render_pdf(geojson: dict, field_length: float, field_width: float) -> bytes
             all_names.append(f["properties"]["name"])
     color_map = _assign_colors(all_names)
 
+
+
     # ── figure layout ─────────────────────────────────────────────────────────
     aspect = field_length / max(field_width, 0.001)
     fig_h  = 10.0
@@ -106,19 +109,32 @@ def _render_pdf(geojson: dict, field_length: float, field_width: float) -> bytes
         else:
             continue
 
-        # plant_instance features are Points — draw as a Circle patch
-        if geom["type"] == "Point":
-            cx, cy      = geom["coordinates"]
+        # plant_instance features are MultiPoint — draw all instances at once
+        # with EllipseCollection (single draw call per species, handles 100k+ points).
+        if geom["type"] == "MultiPoint":
             radius_data = props["radius_m"]
-            circle = plt.Circle(
-                (cx, cy), radius_data,
-                facecolor=style["fc"],
-                edgecolor=style.get("ec", "none"),
-                linewidth=style.get("lw", 0),
+            coords      = geom["coordinates"]
+            if not coords:
+                continue
+            diam = radius_data * 2
+            coll = EllipseCollection(
+                widths=[diam] * len(coords),
+                heights=[diam] * len(coords),
+                angles=0,
+                units="x",                    # sizes in data (metre) coordinates
+                facecolors=style["fc"],
+                edgecolors=style.get("ec", "none"),
+                linewidths=style.get("lw", 0),
                 alpha=style.get("alpha", 1.0),
                 zorder=zorder,
+                offsets=coords,
+                offset_transform=ax.transData,
             )
-            ax.add_patch(circle)
+            ax.add_collection(coll)
+            # Label once per species, at the first instance position
+            if name and color:
+                cx, cy = coords[0]
+                pending_labels.append((cx, cy, radius_data, name, color, zorder))
         else:
             coords = geom["coordinates"][0]
             patch  = MplPolygon(
@@ -135,9 +151,7 @@ def _render_pdf(geojson: dict, field_length: float, field_width: float) -> bytes
                 ys = [c[1] for c in coords]
                 cx, cy      = sum(xs) / len(xs), sum(ys) / len(ys)
                 radius_data = (max(xs) - min(xs)) / 2
-
-        if name and color:
-            pending_labels.append((cx, cy, radius_data, name, color, zorder))
+                pending_labels.append((cx, cy, radius_data, name, color, zorder))
 
     # ── legend ────────────────────────────────────────────────────────────────
     ax_leg.axis("off")

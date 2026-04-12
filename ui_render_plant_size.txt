@@ -1,0 +1,77 @@
+The plants are rendering but at the wrong size. Here is exactly how the plant
+size is encoded and how to use it.
+
+─────────────────────────────────────────────────────────────────
+THE SIZE FIELDS
+─────────────────────────────────────────────────────────────────
+Every plant_instance feature has two size properties:
+
+  feature.properties.spread_m  — full diameter of the plant in metres  (e.g. 0.40)
+  feature.properties.radius_m  — half the diameter in metres           (e.g. 0.20)
+
+radius_m = spread_m / 2   (they are consistent, use whichever is easier)
+
+These are in the same unit and coordinate system as all other geometry in the
+response: field-local metres.
+
+─────────────────────────────────────────────────────────────────
+HOW TO DRAW EACH PLANT AT THE CORRECT SIZE
+─────────────────────────────────────────────────────────────────
+Each [x, y] coordinate in geometry.coordinates is the CENTER of one plant circle.
+The circle radius is radius_m, expressed in field metres — the same unit as x and y.
+
+So if your renderer maps field metres directly to canvas/screen units, draw:
+
+  circle center  = (x, y)
+  circle radius  = feature.properties.radius_m        ← in metres
+
+If your canvas uses a scale factor (pixels per metre), convert like this:
+
+  const scale = canvasWidthPx / fieldLengthMetres;   // pixels per metre
+
+  feature.geometry.coordinates.forEach(([x, y]) => {
+      const cx = x * scale;
+      const cy = canvasHeightPx - (y * scale);       // flip y if y=0 is top
+      const r  = feature.properties.radius_m * scale;
+      drawCircle(cx, cy, r);
+  });
+
+─────────────────────────────────────────────────────────────────
+CONCRETE EXAMPLE
+─────────────────────────────────────────────────────────────────
+Plant species: Tomato
+  spread_m = 0.40   →   diameter 40 cm
+  radius_m = 0.20   →   radius   20 cm
+
+Field: 200 m wide, canvas: 1000 px wide  →  scale = 5 px/m
+
+A Tomato at coordinate [12.4, 3.6] should be drawn as:
+  cx = 12.4 × 5 = 62 px
+  cy = canvasHeight - (3.6 × 5) px
+  r  = 0.20 × 5 = 1 px radius
+
+For a 10 m × 20 m test field on a 500 × 1000 px canvas (scale = 50 px/m):
+  r  = 0.20 × 50 = 10 px radius   ← clearly visible circles
+
+─────────────────────────────────────────────────────────────────
+WHAT THE PDF DOES (reference implementation)
+─────────────────────────────────────────────────────────────────
+The PDF renders plants correctly using matplotlib EllipseCollection with
+sizes in data (metre) coordinates:
+
+  diameter = feature.properties.radius_m * 2   # in metres
+  EllipseCollection(widths=diameter, heights=diameter, units="x", ...)
+  # units="x" means the diameter is in the same metre units as the coordinates
+
+The result is circles that are exactly spread_m wide in the field coordinate space.
+Your canvas renderer should do the same: treat radius_m as a metre value and
+apply whatever metres→pixels (or metres→canvas-units) scale your renderer uses.
+
+─────────────────────────────────────────────────────────────────
+SUMMARY
+─────────────────────────────────────────────────────────────────
+  [x, y]     →  circle center, in field metres
+  radius_m   →  circle radius, in field metres  (same unit as x and y)
+  spread_m   →  circle diameter, in field metres (= radius_m × 2)
+
+Do NOT use a fixed pixel radius. Scale radius_m by your metres→canvas scale factor.

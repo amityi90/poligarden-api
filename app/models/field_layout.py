@@ -1,5 +1,7 @@
 from __future__ import annotations
+import bisect
 import math
+import time
 from shapely.geometry import Point
 from app.models.pv_system import PVSystem, PANEL_WIDTH_M, PANEL_HEIGHT_M, ROW_SPACING
 from app.models.plant import Plant
@@ -90,13 +92,17 @@ class FieldLayout:
     # ── public API ────────────────────────────────────────────────────────────
 
     def build(self) -> FieldLayout:
+        t0 = time.perf_counter()
         self._build_plant_rows()
         self._build_pv_rows()
         self._mark_shadow_rows()
         if self.trees:
             self._build_tree_rows()
             self._mark_tree_rows()
+        t1 = time.perf_counter()
         self._pack_plant_rows()
+        t2 = time.perf_counter()
+        print(f"[build] setup={t1-t0:.3f}s  pack={t2-t1:.3f}s  total={t2-t0:.3f}s")
         return self
 
     def to_geojson(self) -> dict:
@@ -120,7 +126,14 @@ class FieldLayout:
             })
 
         # 3. Plant instances — one MultiPoint per species.
-        #    Reduces tens of thousands of Point features to ~10-50 MultiPoints.
+        #    All placements of a species share a single GeoJSON feature,
+        #    reducing ~100k features to ~35 and keeping the response small.
+        #
+        #    UI rendering note:
+        #      feature.geometry.type  === "MultiPoint"
+        #      feature.geometry.coordinates  → [[x,y], [x,y], …]   (one per plant)
+        #      feature.properties.radius_m   → circle radius in metres
+        #    For each coordinate, draw a filled circle of that radius centred at (x, y).
         for plant_id, data in self._plant_points.items():
             features.append({
                 "type": "Feature",
@@ -164,24 +177,24 @@ class FieldLayout:
         """
         Fill a rectangle with filler plants using largest-fit, row-by-row.
         (x0, y0_abs) is the absolute bottom-left corner; (w, h) is the size.
+        Uses binary search (O log n) to find the largest fitting plant.
         """
         if w <= 0 or h <= 0 or not fillers:
             return
-        sm = fillers[0].spread / 100
-        ly = 0.0
+        sizes = [f.spread / 100 for f in fillers]   # pre-cached, sorted asc
+        sm    = sizes[0]
+        ly    = 0.0
         while ly + sm <= h:
             lx    = 0.0
             max_h = 0.0
             while lx + sm <= w:
-                best = next(
-                    (f for f in reversed(fillers)
-                     if lx + f.spread / 100 <= w and ly + f.spread / 100 <= h),
-                    None,
-                )
-                if best is None:
+                max_size = min(w - lx, h - ly)
+                idx = bisect.bisect_right(sizes, max_size + 1e-9) - 1
+                if idx < 0:
                     break
-                s = best.spread / 100
-                r = s / 2
+                s    = sizes[idx]
+                best = fillers[idx]
+                r    = s / 2
                 self._emit_plant(x0 + lx + r, y0_abs + ly + r, best, row_index)
                 lx    += s
                 max_h  = max(max_h, s)
@@ -210,10 +223,12 @@ class FieldLayout:
         if not main_plants:
             return []
 
-        eff_fillers = gap_fillers if gap_fillers else main_plants
+        eff_fillers  = gap_fillers if gap_fillers else main_plants
+        main_sizes   = [p.spread / 100 for p in main_plants]   # pre-cached
+        n_main       = len(main_plants)
         col_intervals: list = []
-        filler_idx = 0
-        curr_x     = x_start
+        filler_idx   = 0
+        curr_x       = x_start
 
         while curr_x < x_end:
             col_y       = 0.0
@@ -222,8 +237,9 @@ class FieldLayout:
             col_x_start = curr_x
 
             while col_y < ROW_HEIGHT:
-                plant = main_plants[filler_idx % len(main_plants)]
-                size  = plant.spread / 100
+                idx   = filler_idx % n_main
+                plant = main_plants[idx]
+                size  = main_sizes[idx]
                 if col_y + size > ROW_HEIGHT or curr_x + size > x_end:
                     break
                 r = size / 2
@@ -231,7 +247,7 @@ class FieldLayout:
                 col_plants.append((curr_x, col_y, size))
                 col_y     += size
                 col_width  = max(col_width, size)
-                filler_idx = (filler_idx + 1) % len(main_plants)
+                filler_idx += 1
 
             if col_width == 0:
                 break   # no plant fits — region too narrow
@@ -278,6 +294,54 @@ class FieldLayout:
 
     # ── row packing dispatch ──────────────────────────────────────────────────
 
+    def _apply_row_template(
+        self,
+        cache: dict,
+        cache_key: tuple,
+        x_start: float, x_end: float,
+        y_abs: float, row_index: int,
+        main: list, fillers: list, neutral: list,
+    ) -> None:
+        """
+        Pack a standard (non-tree) row using a template cache.
+
+        On the first call for a given (x_start, x_end, plant-list combination),
+        runs _pack_columns + _fill_x_gaps normally and records every emitted
+        plant as a (rel_cx, rel_cy, …) tuple relative to (x_start, y_abs).
+
+        On subsequent calls with the same key, replays the recorded template —
+        just appending coordinates — without re-running the packing algorithm.
+        For a 200 m field with 80 regular rows this is an ~80× speedup.
+        """
+        if cache_key in cache:
+            for rel_cx, rel_cy, pid, pname, sm, rm in cache[cache_key]:
+                if pid not in self._plant_points:
+                    self._plant_points[pid] = {
+                        "plant_name": pname,
+                        "spread_m":   sm,
+                        "radius_m":   rm,
+                        "coords":     [],
+                    }
+                self._plant_points[pid]["coords"].append(
+                    [round(x_start + rel_cx, 4), round(y_abs + rel_cy, 4)]
+                )
+            return
+
+        # ── first call: run packing and record the delta ──────────────────────
+        snapshot = {pid: len(d["coords"]) for pid, d in self._plant_points.items()}
+
+        cols = self._pack_columns(x_start, x_end, y_abs, row_index, main, fillers)
+        self._fill_x_gaps(x_start, x_end, y_abs, cols, neutral, row_index)
+
+        template: list = []
+        for pid, data in self._plant_points.items():
+            start = snapshot.get(pid, 0)
+            if len(data["coords"]) > start:
+                pname, sm, rm = data["plant_name"], data["spread_m"], data["radius_m"]
+                for cx, cy in data["coords"][start:]:
+                    template.append((cx - x_start, cy - y_abs, pid, pname, sm, rm))
+        cache[cache_key] = template
+
     def _pack_plant_rows(self) -> None:
         """Dispatch each plant row to the appropriate packing strategy."""
 
@@ -299,34 +363,52 @@ class FieldLayout:
 
         neutral = _flat_sorted(self.neutral_plants)
 
+
+        # Template caches keyed by (x_start, x_end, id(main), id(fillers), id(neutral)).
+        # Using list identity (id) is safe because the lists are built once above.
+        row_cache: dict = {}
+
+        t_tree = t_adj = t_shadow = t_sun = 0.0
+        n_tree = n_adj = n_shadow = n_sun = 0
+
         for row_index, row_y_bottom in enumerate(self._row_y_bottoms):
             meta = self._row_metadata[row_index]
+            _t = time.perf_counter()
 
             if meta["is_tree_row"]:
                 self._pack_tree_row(row_index, row_y_bottom)
+                t_tree += time.perf_counter() - _t; n_tree += 1
 
             elif meta["is_above_tree_row"] or meta["is_below_tree_row"]:
                 self._pack_adjacent_tree_row(row_index, row_y_bottom)
+                t_adj += time.perf_counter() - _t; n_adj += 1
 
             elif meta["is_in_shadow"]:
-                cols = self._pack_columns(
+                n = neutral or shadow_fillers
+                self._apply_row_template(
+                    row_cache,
+                    (0.0, self.field_length, id(shadow_main), id(shadow_fillers), id(n)),
                     0.0, self.field_length, row_y_bottom, row_index,
-                    shadow_main, shadow_fillers,
+                    shadow_main, shadow_fillers, n,
                 )
-                self._fill_x_gaps(
-                    0.0, self.field_length, row_y_bottom, cols,
-                    neutral or shadow_fillers, row_index,
-                )
+                t_shadow += time.perf_counter() - _t; n_shadow += 1
 
             else:
-                cols = self._pack_columns(
+                n = neutral or sun_fillers
+                self._apply_row_template(
+                    row_cache,
+                    (0.0, self.field_length, id(sun_main), id(sun_fillers), id(n)),
                     0.0, self.field_length, row_y_bottom, row_index,
-                    sun_main, sun_fillers,
+                    sun_main, sun_fillers, n,
                 )
-                self._fill_x_gaps(
-                    0.0, self.field_length, row_y_bottom, cols,
-                    neutral or sun_fillers, row_index,
-                )
+                t_sun += time.perf_counter() - _t; n_sun += 1
+
+        print(
+            f"[pack] rows: tree={n_tree}({t_tree:.3f}s)  "
+            f"adj={n_adj}({t_adj:.3f}s)  "
+            f"shadow={n_shadow}({t_shadow:.3f}s)  "
+            f"sun={n_sun}({t_sun:.3f}s)"
+        )
 
     # ── tree-adjacent row packing ─────────────────────────────────────────────
 

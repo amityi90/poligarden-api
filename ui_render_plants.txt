@@ -1,0 +1,66 @@
+The API response from /generate_field_layout is a GeoJSON FeatureCollection.
+All features except plants are already rendering correctly.
+
+Plants are not rendering because their geometry type changed from "Point" to "MultiPoint".
+Here is exactly what you need to handle:
+
+─────────────────────────────────────────────────────────────────
+PLANT FEATURE FORMAT
+─────────────────────────────────────────────────────────────────
+{
+  "type": "Feature",
+  "geometry": {
+    "type": "MultiPoint",
+    "coordinates": [
+      [x1, y1],
+      [x2, y2],
+      ...
+    ]
+  },
+  "properties": {
+    "type":       "plant_instance",
+    "plant_id":   12,
+    "plant_name": "Tomato",
+    "spread_m":   0.4,
+    "radius_m":   0.2
+  }
+}
+
+- coordinates is a flat array of [x, y] pairs — one pair per plant placement in the field.
+- radius_m is the circle radius in metres for every instance of this species.
+- All coordinates are in field-local metres: x ∈ [0, field_length], y ∈ [0, field_width].
+  (0,0) is the south-west corner, x grows east, y grows north.
+- There is one MultiPoint feature per plant species, not one per individual plant.
+
+─────────────────────────────────────────────────────────────────
+HOW TO RENDER
+─────────────────────────────────────────────────────────────────
+Iterate features. When you find one where:
+  feature.properties.type === "plant_instance"
+  feature.geometry.type   === "MultiPoint"
+
+draw a filled circle for every coordinate in geometry.coordinates:
+
+  const radius = feature.properties.radius_m;
+  const color  = colorForSpecies(feature.properties.plant_name); // your color logic
+
+  feature.geometry.coordinates.forEach(([x, y]) => {
+      // draw a filled circle centered at (x, y) with the given radius
+  });
+
+─────────────────────────────────────────────────────────────────
+WHAT CHANGED (for context)
+─────────────────────────────────────────────────────────────────
+Previously each plant instance was its own Point feature:
+  { "geometry": { "type": "Point", "coordinates": [x, y] } }
+  → one feature per plant = up to 100,000+ features for large fields
+
+Now all instances of a species are in one MultiPoint feature:
+  { "geometry": { "type": "MultiPoint", "coordinates": [[x1,y1], [x2,y2], ...] } }
+  → one feature per species = ~35 features regardless of field size
+
+The properties (plant_name, radius_m, etc.) are identical to before — only the
+geometry type and the fact that one feature covers all instances changed.
+
+No other feature types changed. Structural features (plant_row, gap, pv_row,
+shadow, tree) are still Polygon features and should already be rendering.
