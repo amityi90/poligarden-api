@@ -1,6 +1,6 @@
 from __future__ import annotations
 import math
-from shapely.geometry import box, Point
+from shapely.geometry import Point
 from app.models.pv_system import PVSystem, PANEL_WIDTH_M, PANEL_HEIGHT_M, ROW_SPACING
 from app.models.plant import Plant
 
@@ -8,8 +8,9 @@ ROW_HEIGHT = 2.0   # plant row height in metres (north–south)
 GAP_HEIGHT = 0.5   # tractor path gap height in metres
 
 
-def _rect(x0: float, y0: float, x1: float, y1: float):
-    return box(x0, y0, x1, y1)
+def _rect_coords(x0: float, y0: float, x1: float, y1: float) -> list:
+    """Return a closed GeoJSON polygon ring for a rectangle — no Shapely needed."""
+    return [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]
 
 
 def _flat_sorted(plants: list, key=lambda p: p.spread) -> list:
@@ -68,8 +69,17 @@ class FieldLayout:
         self.sun_ungrouped    = sun_ungrouped or []
         self.neutral_plants   = neutral_plants or []
 
-        self._geometries: list = []
-        self._properties: list[dict] = []
+        # Rectangular structural features (plant rows, gaps, PV panels, shadows):
+        # coords are pre-built lists — no Shapely needed.
+        self._rect_coords: list[list] = []
+        self._rect_props:  list[dict] = []
+        # Tree circle features — Shapely buffer (few dozen at most).
+        self._tree_geoms:  list       = []
+        self._tree_props:  list[dict] = []
+        # Plant instances aggregated by species → one MultiPoint per plant.
+        # {plant_id: {"plant_name":…, "spread_m":…, "radius_m":…, "coords":[…]}}
+        self._plant_points: dict[int, dict] = {}
+
         self._row_y_bottoms: list[float] = []
         self._tree_zones: dict[int, list] = {}
         self._tree_row_indices: set[int] = set()
@@ -91,30 +101,56 @@ class FieldLayout:
 
     def to_geojson(self) -> dict:
         features = []
-        for geom, props in zip(self._geometries, self._properties):
-            if geom.geom_type == "Point":
-                geometry = {"type": "Point", "coordinates": [geom.x, geom.y]}
-            else:
-                coords = [list(c) for c in geom.exterior.coords]
-                geometry = {"type": "Polygon", "coordinates": [coords]}
-            features.append({"type": "Feature", "geometry": geometry, "properties": props})
+
+        # 1. Rectangular structural features — coords already pre-built, no Shapely
+        for coords, props in zip(self._rect_coords, self._rect_props):
+            features.append({
+                "type": "Feature",
+                "geometry": {"type": "Polygon", "coordinates": [coords]},
+                "properties": props,
+            })
+
+        # 2. Tree circle features — convert Shapely buffer polygon
+        for geom, props in zip(self._tree_geoms, self._tree_props):
+            coords = [list(c) for c in geom.exterior.coords]
+            features.append({
+                "type": "Feature",
+                "geometry": {"type": "Polygon", "coordinates": [coords]},
+                "properties": props,
+            })
+
+        # 3. Plant instances — one MultiPoint per species.
+        #    Reduces tens of thousands of Point features to ~10-50 MultiPoints.
+        for plant_id, data in self._plant_points.items():
+            features.append({
+                "type": "Feature",
+                "geometry": {"type": "MultiPoint", "coordinates": data["coords"]},
+                "properties": {
+                    "type":       "plant_instance",
+                    "plant_id":   plant_id,
+                    "plant_name": data["plant_name"],
+                    "spread_m":   data["spread_m"],
+                    "radius_m":   data["radius_m"],
+                },
+            })
+
         return {"type": "FeatureCollection", "features": features}
 
     # ── primitive emitters ────────────────────────────────────────────────────
 
     def _emit_plant(self, cx: float, cy: float, plant, row_index: int = -1) -> None:
-        """Emit a plant_instance as a Point at its circle centre."""
-        size   = plant.spread / 100
-        radius = size / 2
-        self._geometries.append(Point(cx, cy))
-        self._properties.append({
-            "type":       "plant_instance",
-            "plant_id":   plant.id,
-            "plant_name": plant.name,
-            "spread_m":   round(size, 2),
-            "radius_m":   round(radius, 4),
-            "row_index":  row_index,
-        })
+        """Accumulate a plant instance into the per-species MultiPoint bucket."""
+        pid = plant.id
+        if pid not in self._plant_points:
+            size   = plant.spread / 100
+            radius = size / 2
+            self._plant_points[pid] = {
+                "plant_name": plant.name,
+                "spread_m":   round(size, 2),
+                "radius_m":   round(radius, 4),
+                "coords":     [],
+            }
+        self._plant_points[pid]["coords"].append([round(cx, 4), round(cy, 4)])
 
     # ── core packing primitives ───────────────────────────────────────────────
 
@@ -415,8 +451,8 @@ class FieldLayout:
         y, row_index = 0.0, 0
         while y + ROW_HEIGHT <= self.field_width:
             self._row_y_bottoms.append(y)
-            self._geometries.append(_rect(0, y, self.field_length, y + ROW_HEIGHT))
-            self._properties.append({"type": "plant_row", "row_index": row_index})
+            self._rect_coords.append(_rect_coords(0, y, self.field_length, y + ROW_HEIGHT))
+            self._rect_props.append({"type": "plant_row", "row_index": row_index})
             self._row_metadata.append({
                 "row_index":         row_index,
                 "y_bottom":          round(y, 4),
@@ -428,8 +464,8 @@ class FieldLayout:
             y += ROW_HEIGHT
             row_index += 1
             if y + GAP_HEIGHT <= self.field_width:
-                self._geometries.append(_rect(0, y, self.field_length, y + GAP_HEIGHT))
-                self._properties.append({"type": "gap"})
+                self._rect_coords.append(_rect_coords(0, y, self.field_length, y + GAP_HEIGHT))
+                self._rect_props.append({"type": "gap"})
                 y += GAP_HEIGHT
 
     def _mark_shadow_rows(self) -> None:
@@ -467,8 +503,8 @@ class FieldLayout:
 
             for i in range(row_panels):
                 x0 = i * PANEL_WIDTH_M
-                self._geometries.append(_rect(x0, y, x0 + PANEL_WIDTH_M, y + PANEL_HEIGHT_M))
-                self._properties.append({"type": "pv_row", "row_index": pv_row_index, "kw": row_kw})
+                self._rect_coords.append(_rect_coords(x0, y, x0 + PANEL_WIDTH_M, y + PANEL_HEIGHT_M))
+                self._rect_props.append({"type": "pv_row", "row_index": pv_row_index, "kw": row_kw})
 
             panels_placed += row_panels
             pv_row_index  += 1
@@ -478,8 +514,8 @@ class FieldLayout:
             if shadow_start < self.field_width:
                 clipped_end = min(shadow_end, self.field_width)
                 self._shadow_y_ranges.append((shadow_start, clipped_end))
-                self._geometries.append(_rect(0, shadow_start, self.field_length, clipped_end))
-                self._properties.append({
+                self._rect_coords.append(_rect_coords(0, shadow_start, self.field_length, clipped_end))
+                self._rect_props.append({
                     "type":            "shadow",
                     "row_index":       pv_row_index - 1,
                     "shadow_length_m": round(pv.shadow_length, 2),
@@ -513,8 +549,8 @@ class FieldLayout:
             tree   = self.trees[tree_index % len(self.trees)]
             radius = (tree.spread / 100) / 2
 
-            self._geometries.append(Point(x, centre_y).buffer(radius, resolution=16))
-            self._properties.append({
+            self._tree_geoms.append(Point(x, centre_y).buffer(radius, resolution=16))
+            self._tree_props.append({
                 "type":     "tree",
                 "name":     tree.name,
                 "spread_m": round(tree.spread / 100, 2),
