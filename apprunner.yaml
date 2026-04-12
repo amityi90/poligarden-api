@@ -2,8 +2,11 @@ version: 1.0
 runtime: python311
 build:
   commands:
+    pre-build:
+      - python3 --version
+      - python3 -m pip --version
     build:
-      - python3 -m pip install --no-cache-dir -r requirements.txt
+      - python3 -m pip install --no-cache-dir --prefer-binary -r requirements.txt
 run:
   command: gunicorn run:app --bind 0.0.0.0:8080
   network:
