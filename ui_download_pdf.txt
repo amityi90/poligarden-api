@@ -1,0 +1,103 @@
+The /generate_field_layout response now includes the field layout PDF
+embedded directly in the JSON, ready to offer as a download.
+
+─────────────────────────────────────────────────────────────────
+WHERE TO FIND THE PDF IN THE RESPONSE
+─────────────────────────────────────────────────────────────────
+The response is still a GeoJSON FeatureCollection. One extra top-level
+field has been added:
+
+  response.pdf_base64   — the complete PDF file, Base64-encoded (UTF-8 string)
+
+Everything else in the response (features, pv_system, shadow_groups, etc.)
+is unchanged.
+
+Example response shape:
+  {
+    "type": "FeatureCollection",
+    "features": [...],
+    "pv_system": {...},
+    "shadow_groups": [...],
+    "pdf_base64": "JVBERi0xLjQKJe..."   ← ~470k chars for a small field
+  }
+
+─────────────────────────────────────────────────────────────────
+HOW TO TRIGGER A BROWSER DOWNLOAD
+─────────────────────────────────────────────────────────────────
+Decode the Base64 string back to binary, wrap it in a Blob with the
+correct MIME type, create an object URL, and click a hidden anchor:
+
+  function downloadPdf(response, filename = "garden_layout.pdf") {
+    // 1. Decode Base64 → binary string → Uint8Array
+    const binary = atob(response.pdf_base64);
+    const bytes  = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+
+    // 2. Wrap in a Blob
+    const blob = new Blob([bytes], { type: "application/pdf" });
+
+    // 3. Create a temporary object URL and click it
+    const url = URL.createObjectURL(blob);
+    const a   = document.createElement("a");
+    a.href     = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+Call it immediately after a successful /generate_field_layout fetch:
+
+  const response = await fetch("/generate_field_layout", { ... }).then(r => r.json());
+  downloadPdf(response);                       // triggers browser Save dialog
+  // response.features, response.pv_system etc. are still available normally
+
+─────────────────────────────────────────────────────────────────
+REACT / HOOK EXAMPLE
+─────────────────────────────────────────────────────────────────
+If you want a "Download PDF" button that appears after the layout loads,
+store the base64 string in state and decode it on click to avoid holding
+the large Uint8Array in memory while it is not needed:
+
+  const [pdfBase64, setPdfBase64] = useState<string | null>(null);
+
+  // After fetching the layout:
+  const data = await generateFieldLayout(params);
+  setLayout(data);
+  setPdfBase64(data.pdf_base64 ?? null);
+
+  // Button handler:
+  function handleDownload() {
+    if (!pdfBase64) return;
+    const binary = atob(pdfBase64);
+    const bytes  = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const blob = new Blob([bytes], { type: "application/pdf" });
+    const url  = URL.createObjectURL(blob);
+    const a    = Object.assign(document.createElement("a"), {
+      href: url, download: "garden_layout.pdf",
+    });
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  // JSX:
+  {pdfBase64 && (
+    <button onClick={handleDownload}>Download PDF</button>
+  )}
+
+─────────────────────────────────────────────────────────────────
+NOTES
+─────────────────────────────────────────────────────────────────
+- The PDF is deleted from the server immediately after it is embedded
+  in the response. There is no persistent file to fetch separately.
+- Do NOT pass pdf_base64 back to the API in subsequent requests —
+  strip it before storing the layout in your state if memory is a concern
+  (large fields produce ~0.5–2 MB of Base64 text).
+- The PDF is rendered with field_length on the X axis (East) and
+  field_width on the Y axis (North), matching the canvas coordinate system.

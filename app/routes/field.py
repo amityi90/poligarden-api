@@ -1,4 +1,5 @@
 import os
+import base64
 from datetime import datetime
 from flask import Blueprint, request, jsonify
 from app.services.field_service import FieldService
@@ -88,7 +89,7 @@ def generate_field_layout():
     geojson["sun_ungrouped"]    = [p.to_dict() for p in sun_ungrouped]
     geojson["neutral_plants"] = [p.to_dict() for p in neutral_plants]
 
-    # save PDF
+    # render PDF, embed as base64, then clean up the file
     os.makedirs(PDF_DIR, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     pdf_path  = os.path.join(PDF_DIR, f"layout_{timestamp}.pdf")
@@ -96,6 +97,9 @@ def generate_field_layout():
     with open(pdf_path, "wb") as f:
         f.write(pdf_bytes)
     print(f"[generate_field_layout] PDF saved to {pdf_path}")
+    geojson["pdf_base64"] = base64.b64encode(pdf_bytes).decode("utf-8")
+    os.remove(pdf_path)
+    print(f"[generate_field_layout] PDF embedded in response and deleted from disk")
 
     print(f"\n[generate_field_layout] trees ({len(trees)}):")
     for tree in trees:
