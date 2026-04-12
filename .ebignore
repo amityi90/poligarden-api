@@ -1,0 +1,12 @@
+.env
+.git
+.claude
+__pycache__
+*.pyc
+*.pdf
+test_large_field.py
+test_layout.pdf
+ui_render_plants.txt
+ui_render_plant_size.txt
+install.cmd
+db/
