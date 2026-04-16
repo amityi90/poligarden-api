@@ -1,7 +1,5 @@
 from __future__ import annotations
-import bisect
 import math
-import time
 from shapely.geometry import Point
 from app.models.pv_system import PVSystem, PANEL_WIDTH_M, PANEL_HEIGHT_M, ROW_SPACING
 from app.models.plant import Plant
@@ -92,17 +90,14 @@ class FieldLayout:
     # ── public API ────────────────────────────────────────────────────────────
 
     def build(self) -> FieldLayout:
-        t0 = time.perf_counter()
         self._build_plant_rows()
         self._build_pv_rows()
         self._mark_shadow_rows()
         if self.trees:
             self._build_tree_rows()
             self._mark_tree_rows()
-        t1 = time.perf_counter()
         self._pack_plant_rows()
-        t2 = time.perf_counter()
-        print(f"[build] setup={t1-t0:.3f}s  pack={t2-t1:.3f}s  total={t2-t0:.3f}s")
+        self._fill_empty_spaces()
         return self
 
     def to_geojson(self) -> dict:
@@ -175,29 +170,37 @@ class FieldLayout:
         row_index: int = -1,
     ) -> None:
         """
-        Fill a rectangle with filler plants using largest-fit, row-by-row.
+        Fill a rectangle with filler plants by cycling through species.
         (x0, y0_abs) is the absolute bottom-left corner; (w, h) is the size.
-        Uses binary search (O log n) to find the largest fitting plant.
+        Cycles through fillers so no single species dominates large gaps.
         """
         if w <= 0 or h <= 0 or not fillers:
             return
         sizes = [f.spread / 100 for f in fillers]   # pre-cached, sorted asc
+        n     = len(fillers)
         sm    = sizes[0]
+        fill_idx = 0
         ly    = 0.0
         while ly + sm <= h:
             lx    = 0.0
             max_h = 0.0
             while lx + sm <= w:
                 max_size = min(w - lx, h - ly)
-                idx = bisect.bisect_right(sizes, max_size + 1e-9) - 1
-                if idx < 0:
+                # Cycle: starting from fill_idx, find the next plant that fits
+                placed = False
+                for attempt in range(n):
+                    idx = (fill_idx + attempt) % n
+                    s = sizes[idx]
+                    if s <= max_size + 1e-9:
+                        r = s / 2
+                        self._emit_plant(x0 + lx + r, y0_abs + ly + r, fillers[idx], row_index)
+                        lx    += s
+                        max_h  = max(max_h, s)
+                        fill_idx = (idx + 1) % n
+                        placed = True
+                        break
+                if not placed:
                     break
-                s    = sizes[idx]
-                best = fillers[idx]
-                r    = s / 2
-                self._emit_plant(x0 + lx + r, y0_abs + ly + r, best, row_index)
-                lx    += s
-                max_h  = max(max_h, s)
             if max_h == 0:
                 break
             ly += max_h
@@ -347,7 +350,11 @@ class FieldLayout:
 
         # Pre-compute flat sorted plant lists once — not per row.
         def _groups_to_plants(groups):
-            return _flat_sorted([p for g in groups for p in g.plants])
+           # return _flat_sorted([p for g in groups for p in g.plants])
+            sorted_plants = []
+            for g in groups:
+                sorted_plants.extend(2 * g.plants)   # double main plants for better fill
+            return sorted_plants
 
         def _groups_to_fillers(groups):
             return _deduped_sorted(
@@ -368,20 +375,14 @@ class FieldLayout:
         # Using list identity (id) is safe because the lists are built once above.
         row_cache: dict = {}
 
-        t_tree = t_adj = t_shadow = t_sun = 0.0
-        n_tree = n_adj = n_shadow = n_sun = 0
-
         for row_index, row_y_bottom in enumerate(self._row_y_bottoms):
             meta = self._row_metadata[row_index]
-            _t = time.perf_counter()
 
             if meta["is_tree_row"]:
                 self._pack_tree_row(row_index, row_y_bottom)
-                t_tree += time.perf_counter() - _t; n_tree += 1
 
             elif meta["is_above_tree_row"] or meta["is_below_tree_row"]:
                 self._pack_adjacent_tree_row(row_index, row_y_bottom)
-                t_adj += time.perf_counter() - _t; n_adj += 1
 
             elif meta["is_in_shadow"]:
                 n = neutral or shadow_fillers
@@ -391,7 +392,6 @@ class FieldLayout:
                     0.0, self.field_length, row_y_bottom, row_index,
                     shadow_main, shadow_fillers, n,
                 )
-                t_shadow += time.perf_counter() - _t; n_shadow += 1
 
             else:
                 n = neutral or sun_fillers
@@ -401,14 +401,250 @@ class FieldLayout:
                     0.0, self.field_length, row_y_bottom, row_index,
                     sun_main, sun_fillers, n,
                 )
-                t_sun += time.perf_counter() - _t; n_sun += 1
 
-        print(
-            f"[pack] rows: tree={n_tree}({t_tree:.3f}s)  "
-            f"adj={n_adj}({t_adj:.3f}s)  "
-            f"shadow={n_shadow}({t_shadow:.3f}s)  "
-            f"sun={n_sun}({t_sun:.3f}s)"
+    # ── empty-space filling ─────────────────────────────────────────────────
+
+    def _find_empty_rects(self, row_y_bottom: float, min_size: float = 0.05) -> list[tuple[float, float, float, float]]:
+        """
+        Find empty rectangles in a row using circle-aware occupied bands.
+        Returns list of (x, y, w, h) tuples, filtered to min_size.
+        """
+        row_y_top = row_y_bottom + ROW_HEIGHT
+        eps = 1e-4
+
+        # Collect occupied bands per plant circle (4 horizontal slices).
+        N_BANDS = 4
+        occupied: list[tuple[float, float, float, float]] = []
+        for data in self._plant_points.values():
+            r = data["radius_m"]
+            for cx, cy in data["coords"]:
+                if cy + r <= row_y_bottom + eps or cy - r >= row_y_top - eps:
+                    continue
+                band_h = 2 * r / N_BANDS
+                py_bot = cy - r
+                for band in range(N_BANDS):
+                    b_bot = max(py_bot + band * band_h, row_y_bottom)
+                    b_top = min(py_bot + (band + 1) * band_h, row_y_top)
+                    if b_top - b_bot < eps:
+                        continue
+                    dy = abs((b_bot + b_top) / 2 - cy)
+                    half_w = math.sqrt(max(r * r - dy * dy, 0))
+                    if half_w < eps:
+                        continue
+                    occupied.append((cx - half_w, b_bot, cx + half_w, b_top))
+
+        if not occupied:
+            return [(0.0, row_y_bottom, self.field_length, ROW_HEIGHT)]
+
+        # Sort occupied boxes by x0 for the sweep
+        occupied.sort()
+
+        # Sweep: quantize x-edges, then for each strip find empty y-gaps.
+        # Merge nearby x-edges to reduce strip count.
+        raw_edges = set()
+        raw_edges.add(0.0)
+        raw_edges.add(self.field_length)
+        for ox0, _, ox1, _ in occupied:
+            raw_edges.add(ox0)
+            raw_edges.add(ox1)
+        x_edges = sorted(raw_edges)
+
+        # Merge x-edges closer than min_size (reduces tiny useless strips)
+        merged_edges = [x_edges[0]]
+        for x in x_edges[1:]:
+            if x - merged_edges[-1] >= min_size:
+                merged_edges.append(x)
+            else:
+                merged_edges[-1] = x  # snap to later edge
+        if merged_edges[-1] < self.field_length - eps:
+            merged_edges.append(self.field_length)
+        x_edges = merged_edges
+
+        empty_rects: list[tuple[float, float, float, float]] = []
+        occ_len = len(occupied)
+
+        for i in range(len(x_edges) - 1):
+            x_left = x_edges[i]
+            x_right = x_edges[i + 1]
+            strip_w = x_right - x_left
+            if strip_w < min_size:
+                continue
+
+            # Find occupied y-intervals overlapping this strip.
+            # occupied is sorted by x0 so we can skip early.
+            y_intervals: list[tuple[float, float]] = []
+            for j in range(occ_len):
+                ox0 = occupied[j][0]
+                if ox0 >= x_right - eps:
+                    break  # all remaining boxes are to the right
+                ox1 = occupied[j][2]
+                if ox1 <= x_left + eps:
+                    continue
+                y_intervals.append((
+                    max(occupied[j][1], row_y_bottom),
+                    min(occupied[j][3], row_y_top),
+                ))
+
+            # Merge overlapping y-intervals and find gaps
+            y_intervals.sort()
+            merged: list[tuple[float, float]] = []
+            for yb, yt in y_intervals:
+                if merged and yb <= merged[-1][1] + eps:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], yt))
+                else:
+                    merged.append((yb, yt))
+
+            prev_y = row_y_bottom
+            for yb, yt in merged:
+                gap_h = yb - prev_y
+                if gap_h >= min_size:
+                    empty_rects.append((x_left, prev_y, strip_w, gap_h))
+                prev_y = yt
+            gap_h = row_y_top - prev_y
+            if gap_h >= min_size:
+                empty_rects.append((x_left, prev_y, strip_w, gap_h))
+
+        return empty_rects
+
+    def _fill_row_gaps(
+        self,
+        empty_rects: list[tuple[float, float, float, float]],
+        plants: list,
+    ) -> None:
+        """
+        Iteratively fill empty rectangles with plants for diversity.
+        Cycles through plants; stops when all plants have been tried
+        without placing any.
+        """
+        if not empty_rects or not plants:
+            return
+
+        # Pre-compute sizes
+        sizes = [p.spread / 100 for p in plants]
+        smallest = min(sizes)
+        n = len(plants)
+        plant_idx = 0
+        misses = 0
+
+        # Filter out rects too small for any plant up front
+        empty_rects = [r for r in empty_rects if r[2] >= smallest - 1e-6 and r[3] >= smallest - 1e-6]
+
+        while empty_rects and misses < n:
+            size = sizes[plant_idx % n]
+            plant = plants[plant_idx % n]
+            placed = False
+
+            for i, (rx, ry, rw, rh) in enumerate(empty_rects):
+                if size <= rw + 1e-6 and size <= rh + 1e-6:
+                    r = size / 2
+                    self._emit_plant(rx + r, ry + r, plant)
+
+                    # Remove used rect, add remainders
+                    empty_rects.pop(i)
+                    right_w = rw - size
+                    if right_w >= smallest - 1e-6:
+                        empty_rects.append((rx + size, ry, right_w, rh))
+                    top_h = rh - size
+                    if top_h >= smallest - 1e-6:
+                        empty_rects.append((rx, ry + size, size, top_h))
+
+                    # Circle corners: the plant is a circle, so 4 corner
+                    # areas of its bounding square are empty.
+                    cs = r * 0.2929  # r * (1 - 1/sqrt(2))
+                    if cs >= smallest - 1e-6:
+                        empty_rects.append((rx, ry, cs, cs))                    # BL
+                        empty_rects.append((rx + size - cs, ry, cs, cs))        # BR
+                        empty_rects.append((rx, ry + size - cs, cs, cs))        # TL
+                        empty_rects.append((rx + size - cs, ry + size - cs, cs, cs))  # TR
+
+                    plant_idx += 1
+                    misses = 0
+                    placed = True
+                    break
+
+            if not placed:
+                plant_idx += 1
+                misses += 1
+
+    def _fill_empty_spaces(self) -> None:
+        """
+        After packing, find empty spaces in each row and fill them
+        with plants from that row's companion groups.
+        Uses template caching for identical rows.
+        """
+        sun_plants = _deduped_sorted(
+            [p for g in self.sun_groups for p in g.plants
+             if p.spread / 100 <= ROW_HEIGHT]
         )
+        shadow_plants = _deduped_sorted(
+            [p for g in self.shadow_groups for p in g.plants
+             if p.spread / 100 <= ROW_HEIGHT]
+        )
+        smallest_sun = min((p.spread / 100 for p in sun_plants), default=ROW_HEIGHT)
+        smallest_shadow = min((p.spread / 100 for p in shadow_plants), default=ROW_HEIGHT)
+
+        # Cache: for template rows (sun/shadow), compute once and replay.
+        # Key = row type string; value = list of (rel_x, rel_y, plant) offsets.
+        fill_cache: dict[str, list] = {}
+
+        for row_index, row_y_bottom in enumerate(self._row_y_bottoms):
+            meta = self._row_metadata[row_index]
+
+            if meta["is_tree_row"]:
+                continue
+
+            # Determine row type and plants
+            if meta["is_above_tree_row"] or meta["is_below_tree_row"]:
+                # Tree-adjacent rows are unique — no caching
+                tree_row_idx = (row_index + 1) if meta["is_above_tree_row"] else (row_index - 1)
+                placements = self._tree_placements.get(tree_row_idx, [])
+                plants = _deduped_sorted([
+                    p for _, _, tree in placements
+                    for g in tree.companion_groups
+                    for p in g.plants
+                    if p.spread / 100 <= ROW_HEIGHT
+                ])
+                if not plants:
+                    continue
+                ms = min(p.spread / 100 for p in plants)
+                empty_rects = self._find_empty_rects(row_y_bottom, ms)
+                if empty_rects:
+                    self._fill_row_gaps(empty_rects, plants)
+                continue
+
+            cache_key = "shadow" if meta["is_in_shadow"] else "sun"
+            plants = shadow_plants if meta["is_in_shadow"] else sun_plants
+            if not plants:
+                continue
+
+            # Use cache for template rows
+            if cache_key in fill_cache:
+                for rel_cx, rel_cy, pid, pname, sm, rm in fill_cache[cache_key]:
+                    if pid not in self._plant_points:
+                        self._plant_points[pid] = {
+                            "plant_name": pname, "spread_m": sm,
+                            "radius_m": rm, "coords": [],
+                        }
+                    self._plant_points[pid]["coords"].append(
+                        [round(rel_cx, 4), round(row_y_bottom + rel_cy, 4)]
+                    )
+                continue
+
+            # First occurrence: compute and record template
+            snapshot = {pid: len(d["coords"]) for pid, d in self._plant_points.items()}
+            ms = smallest_shadow if meta["is_in_shadow"] else smallest_sun
+            empty_rects = self._find_empty_rects(row_y_bottom, ms)
+            if empty_rects:
+                self._fill_row_gaps(empty_rects, plants)
+
+            template: list = []
+            for pid, data in self._plant_points.items():
+                start = snapshot.get(pid, 0)
+                if len(data["coords"]) > start:
+                    pname, sm, rm = data["plant_name"], data["spread_m"], data["radius_m"]
+                    for cx, cy in data["coords"][start:]:
+                        template.append((cx, cy - row_y_bottom, pid, pname, sm, rm))
+            fill_cache[cache_key] = template
 
     # ── tree-adjacent row packing ─────────────────────────────────────────────
 

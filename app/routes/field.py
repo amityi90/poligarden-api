@@ -11,6 +11,11 @@ PDF_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "pdf_field_la
 field_bp = Blueprint("field", __name__)
 
 
+@field_bp.route("/health")
+def health():
+    return "ok", 200
+
+
 @field_bp.post("/generate_field_layout")
 def generate_field_layout():
     data = request.get_json(silent=True)
@@ -96,27 +101,17 @@ def generate_field_layout():
     pdf_bytes = _render_pdf(geojson, field_length, field_width)
     with open(pdf_path, "wb") as f:
         f.write(pdf_bytes)
-    print(f"[generate_field_layout] PDF saved to {pdf_path}")
     geojson["pdf_base64"] = base64.b64encode(pdf_bytes).decode("utf-8")
     os.remove(pdf_path)
-    print(f"[generate_field_layout] PDF embedded in response and deleted from disk")
 
-    print(f"\n[generate_field_layout] trees ({len(trees)}):")
-    for tree in trees:
-        comp_names    = [p.name for p in tree.companion_non_tree_plants]
-        non_ant_names = [p.name for p in tree.non_antagonistic_plants]
-        print(f"  {tree.name}")
-        print(f"    companion_non_tree_plants : {comp_names}")
-        print(f"    non_antagonistic_plants   : {non_ant_names}")
+    print(f"\n[generate_field_layout] Sun companion groups ({len(sun_groups)}):")
+    for i, g in enumerate(sun_groups):
+        names = [p.name for p in g.plants]
+        print(f"  Group {i}: {names}")
 
-    print("\n[generate_field_layout] row metadata:")
-    for row in layout._row_metadata:
-        flags = []
-        if row["is_tree_row"]:        flags.append("TREE")
-        if row["is_above_tree_row"]:  flags.append("ABOVE_TREE")
-        if row["is_below_tree_row"]:  flags.append("BELOW_TREE")
-        if row["is_in_shadow"]:       flags.append("SHADOW")
-        flag_str = ", ".join(flags) if flags else "normal"
-        print(f"  row {row['row_index']:2d} | y={row['y_bottom']:.2f}m | {flag_str}")
+    print(f"\n[generate_field_layout] Shadow companion groups ({len(shadow_groups)}):")
+    for i, g in enumerate(shadow_groups):
+        names = [p.name for p in g.plants]
+        print(f"  Group {i}: {names}")
 
     return jsonify(geojson)

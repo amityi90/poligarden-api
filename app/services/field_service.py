@@ -115,59 +115,51 @@ class FieldService:
     @staticmethod
     def build_companion_groups(plants: list[Plant]) -> list[CompanionGroup]:
         """
-        Group plants into CompanionGroups following two rules:
-          1. Plants in the same group must not be antagonists of each other.
-          2. Prefer placing a plant in a group where it already has companions.
-
-        Algorithm:
-          - Sort by companion count descending so well-connected plants
-            anchor groups first — this reduces the number of singleton groups.
-          - For each plant, score every existing group by how many companions
-            it already has there. Pick the highest-scoring group that has no
-            antagonist conflict. If none fits, open a new singleton group.
+        For each plant (the "main plant"), create one or more companion groups.
+        Each group starts with the main plant and gets companions added one by
+        one. If a companion is antagonistic to any plant already in a group,
+        try the next group. If no group accepts it, open a new group seeded
+        with the main plant.
         """
-        # Pre-compute companion/antagonist ID sets per plant (IDs only, fast lookup)
-        companion_ids: dict[int, set[int]] = {
-            p.id: {c.id for c in p.companion_plants} for p in plants
-        }
+        selected_ids = {p.id for p in plants}
+        plant_by_id = {p.id: p for p in plants}
         antagonist_ids: dict[int, set[int]] = {
             p.id: {a.id for a in p.antagonistic_plants} for p in plants
         }
 
-        # Sort most-connected first so they anchor groups early
-        sorted_plants = sorted(plants, key=lambda p: len(companion_ids[p.id]), reverse=True)
+        all_groups: list[CompanionGroup] = []
+        for main_plant in plants:
+            companions = [
+                plant_by_id[c.id]
+                for c in main_plant.companion_plants
+                if c.id in selected_ids and c.id != main_plant.id
+            ]
 
-        groups: list[CompanionGroup] = []
+            plant_groups: list[CompanionGroup] = [CompanionGroup()]
+            plant_groups[0].plants = [main_plant]
 
-        for plant in sorted_plants:
-            p_antagonists = antagonist_ids[plant.id]
-            p_companions  = companion_ids[plant.id]
+            for comp in companions:
+                comp_antagonists = antagonist_ids.get(comp.id, set())
+                placed = False
+                for g in plant_groups:
+                    if not (g.plant_ids() & comp_antagonists):
+                        g.plants.append(comp)
+                        placed = True
+                        break
+                if not placed:
+                    new_g = CompanionGroup()
+                    new_g.plants = [main_plant, comp]
+                    plant_groups.append(new_g)
 
-            best_group: CompanionGroup | None = None
-            best_score = -1
+            for g in plant_groups:
+                if not any(p.spread > 90 for p in g.plants):
+                    g.plants = g.plants * 3
+                g.arrange_plants()
+                g.planting_length = sum(p.spread for p in g.plants) / 100 * 3
 
-            for group in groups:
-                if not group.can_accept(plant, p_antagonists):
-                    continue
-                score = group.companion_score(plant, p_companions)
-                if score > best_score:
-                    best_score = score
-                    best_group = group
+            all_groups.extend(plant_groups)
 
-            if best_group is not None:
-                best_group.plants.append(plant)
-            else:
-                new_group = CompanionGroup()
-                new_group.plants.append(plant)
-                groups.append(new_group)
-
-        groups = [g for g in groups if len(g.plants) > 2]
-
-        for group in groups:
-            group.arrange_plants()
-            group.planting_length = sum(p.spread for p in group.plants) / 100 * 3
-
-        return groups
+        return all_groups
 
     @staticmethod
     def assign_non_antagonistic_plants(
