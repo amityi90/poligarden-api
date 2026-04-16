@@ -8,7 +8,7 @@ build:
     build:
       - python3 -m pip install --no-cache-dir --prefer-binary -r requirements.txt
 run:
-  command: gunicorn run:app --bind 0.0.0.0:8080
+  command: python3 -m gunicorn run:app --bind 0.0.0.0:8080
   network:
     port: 8080
     env: PORT
