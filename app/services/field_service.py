@@ -2,7 +2,7 @@ from app.db import get_db
 from app.models.plant import Plant
 from app.models.tree import Tree
 from app.models.companion_group import CompanionGroup
-from app.models.field_layout import FieldLayout
+from app.models.field_layout2 import FieldLayout
 from app.models.pv_system import PVSystem
 
 
@@ -228,10 +228,14 @@ class FieldService:
         sun_ungrouped: list[Plant] | None = None,
         neutral_plants: list[Plant] | None = None,
     ) -> FieldLayout:
+        shadow_plants = [p for g in (shadow_groups or []) for p in g.plants]
+        sun_plants    = [p for g in (sun_groups    or []) for p in g.plants]
+
         return FieldLayout(
             field_length, field_width, pv_system,
             trees=trees,
-            shadow_groups=shadow_groups, sun_groups=sun_groups,
+            shadow_plants=shadow_plants,
+            sun_plants=sun_plants,
             non_tree_plants=non_tree_plants,
             shadow_ungrouped=shadow_ungrouped, sun_ungrouped=sun_ungrouped,
             neutral_plants=neutral_plants,
