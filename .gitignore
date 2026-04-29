@@ -24,3 +24,7 @@ pdf_field_layout/
 .idea/
 *.DS_Store
 Thumbs.db
+
+# Local install artifacts
+*.msi
+install.cmd
