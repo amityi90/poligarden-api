@@ -66,6 +66,10 @@ class FieldLayout:
         self._tree_row_indices: set[int] = set()
         self._shadow_y_ranges: list[tuple[float, float]] = []
         self._row_metadata: list[dict] = []
+        # Per-tree-row placements: {row_index: [(x_center, radius, Tree), …]}
+        # Captured at tree-placement time so tree-row / adjacent-tree-row packing
+        # can reach the Tree object's companion lists later.
+        self._tree_placements: dict[int, list[tuple]] = {}
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -76,6 +80,7 @@ class FieldLayout:
         if self.trees:
             self._build_tree_rows()
             self._mark_tree_rows()
+            self.pack_plants_in_trees_rows()
         self.assign_packed_rows_to_field()
         self.plot()
         return self
@@ -285,11 +290,15 @@ class FieldLayout:
         Pack two template rows (one sun, one shadow) — main packing followed
         by `pack_free_spaces_in_row` for gap filling — then **replicate each
         template into every other plant row of the same kind** by translating
-        the captured placements to that row's `y_bottom`. The whole field
-        ends up filled with the same diversity pattern as the templates.
+        the captured placements to that row's `y_bottom`. Tree rows and the
+        rows directly above/below tree rows are skipped here — they are
+        packed separately by `pack_plants_in_trees_rows()`.
         """
-        sun_template_idx    = next((m["row_index"] for m in self._row_metadata if not m["is_in_shadow"]), None)
-        shadow_template_idx = next((m["row_index"] for m in self._row_metadata if     m["is_in_shadow"]), None)
+        def is_regular(meta: dict) -> bool:
+            return not (meta["is_tree_row"] or meta["is_above_tree_row"] or meta["is_below_tree_row"])
+
+        sun_template_idx    = next((m["row_index"] for m in self._row_metadata if is_regular(m) and not m["is_in_shadow"]), None)
+        shadow_template_idx = next((m["row_index"] for m in self._row_metadata if is_regular(m) and     m["is_in_shadow"]), None)
 
         sun_template, shadow_template = None, None
 
@@ -315,6 +324,8 @@ class FieldLayout:
             ri = meta["row_index"]
             if ri == sun_template_idx or ri == shadow_template_idx:
                 continue   # template row — already packed
+            if not is_regular(meta):
+                continue   # tree row / adjacent — packed by pack_plants_in_trees_rows
             if meta["is_in_shadow"]:
                 if shadow_template:
                     self._apply_template(shadow_template, meta["y_bottom"])
@@ -372,7 +383,7 @@ class FieldLayout:
             r = data["radius_m"]
             for cx, cy in data["coords"]:
                 if y_bottom <= cy <= y_top:
-                    geoms.append(Point(cx, cy).buffer(r, resolution=16))
+                    geoms.append(Point(cx, cy).buffer(r, resolution=4))
                     attrs.append({
                         "plant_id":   pid,
                         "plant_name": data["plant_name"],
@@ -400,69 +411,120 @@ class FieldLayout:
         fillers: list[Plant],
     ) -> None:
         """
-        Fill the empty spaces left by `pack_plants_in_row`. The gap geometry
-        is computed via geopandas — the union of the planted plants is
-        subtracted from the union of the row — and `fillers` are then packed
-        into the gap on a coarse grid (smallest species first), with each
-        placed circle subtracted from the remaining gap so we never overlap.
-
-        Pure side-effect: each placement is appended to `self._plant_points`.
+        Fill the empty spaces left by `pack_plants_in_row` inside the row(s)
+        described by `row_gdf`. The previous implementation tracked the gap
+        as a polygon and used `gap.covers(circle)` + `gap.difference(circle)`
+        per candidate, which scaled O(N²) and ran into the minutes for a
+        200 m row. This version stores placed circles in a flat
+        `(cx, cy, r)` list and uses a cell-bucket spatial hash to test
+        overlap by simple Euclidean distance — no Shapely calls in the hot
+        loop. Behaviour (cycle-through-fillers diversity, smallest grid step)
+        is unchanged. Pure side-effect: each placement is appended to
+        `self._plant_points`.
         """
         if not fillers or row_gdf.empty:
             return
 
-        row_geom = row_gdf.geometry.unary_union
-        if not plants_gdf.empty:
-            planted_union = plants_gdf.geometry.unary_union
-            gap_geom      = row_geom.difference(planted_union)
-        else:
-            gap_geom = row_geom
+        # Row bounds — for axis-aligned rectangles `total_bounds` is exact and
+        # avoids the cost of `unary_union`.
+        minx, miny, maxx, maxy = row_gdf.total_bounds
 
-        if gap_geom.is_empty:
-            return
+        # Snapshot existing plants as plain (cx, cy, r) tuples — no buffers.
+        existing: list[tuple[float, float, float]] = []
+        if not plants_gdf.empty:
+            for _, row in plants_gdf.iterrows():
+                c = row.geometry.centroid
+                existing.append((c.x, c.y, float(row["radius_m"])))
 
         sizes    = [p.spread / 100 for p in fillers]
         n        = len(fillers)
         min_size = min(sizes)
         if min_size <= 0:
             return
-        step = min_size
+        max_size    = max(sizes)
+        max_other_r = max((r for _, _, r in existing), default=0.0)
+        # Cell size = max plant diameter so any overlap involves the
+        # candidate's bucket or one of its 8 neighbours.
+        cell_size = max(max_size, 2 * max_other_r)
+        if cell_size <= 0:
+            return
 
-        minx, miny, maxx, maxy = gap_geom.bounds
-        idx = 0  # cycling index — advanced after every placement for diversity
-        y = miny + min_size / 2
+        buckets: dict[tuple[int, int], list[int]] = {}
+
+        def _bucket_of(cx: float, cy: float) -> tuple[int, int]:
+            return (int(cx // cell_size), int(cy // cell_size))
+
+        for k, (cx, cy, r) in enumerate(existing):
+            buckets.setdefault(_bucket_of(cx, cy), []).append(k)
+
+        def _overlaps(x: float, y: float, r: float) -> bool:
+            bx, by = _bucket_of(x, y)
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for k in buckets.get((bx + dx, by + dy), ()):
+                        ocx, ocy, oradius = existing[k]
+                        if (x - ocx) ** 2 + (y - ocy) ** 2 < (r + oradius) ** 2:
+                            return True
+            return False
+
+        # Compute the max radius that fits at (x, y) in a *single* sweep over
+        # nearby buckets, instead of running an overlap check per species.
+        # That collapses the cost from O(cells × species × bucket_density) to
+        # O(cells × bucket_density), which matters once fillers accumulate
+        # (bucket_density grows with placement count).
+        from math import sqrt as _sqrt
+
+        def _max_fit_radius(x: float, y: float) -> float:
+            r_max = min(x - minx, maxx - x, y - miny, maxy - y)
+            if r_max <= 0:
+                return 0.0
+            bx, by = _bucket_of(x, y)
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for k in buckets.get((bx + dx, by + dy), ()):
+                        ocx, ocy, oradius = existing[k]
+                        d = _sqrt((x - ocx) ** 2 + (y - ocy) ** 2) - oradius
+                        if d < r_max:
+                            r_max = d
+                            if r_max <= 0:
+                                return 0.0
+            return r_max
+
+        step = min_size
+        idx  = 0  # cycling index — advanced after every placement for diversity
+        y    = miny + min_size / 2
         while y <= maxy - min_size / 2 + 1e-9:
             x = minx + min_size / 2
             while x <= maxx - min_size / 2 + 1e-9:
+                r_max = _max_fit_radius(x, y)
+                if r_max < min_size / 2:
+                    x += step
+                    continue
+                # Pick the next species in the cycle whose radius fits r_max.
                 placed = False
-                # Try the next species in the cycle first; only fall through to
-                # later species when the current one doesn't fit (too big for
-                # the remaining gap, or running off the row's bbox).
                 for offset in range(n):
                     i    = (idx + offset) % n
                     size = sizes[i]
                     r    = size / 2
-                    if x - r < minx or x + r > maxx or y - r < miny or y + r > maxy:
+                    if r > r_max:
                         continue
-                    circle = Point(x, y).buffer(r, resolution=12)
-                    if gap_geom.covers(circle):
-                        plant = fillers[i]
-                        pid   = plant.id
-                        if pid not in self._plant_points:
-                            self._plant_points[pid] = {
-                                "plant_name": plant.name,
-                                "spread_m":   round(size, 2),
-                                "radius_m":   round(r, 4),
-                                "coords":     [],
-                            }
-                        self._plant_points[pid]["coords"].append([round(x, 4), round(y, 4)])
-                        gap_geom = gap_geom.difference(circle)
-                        if gap_geom.is_empty:
-                            return
-                        idx     = (i + 1) % n   # advance cycle past placed species
-                        x      += size
-                        placed  = True
-                        break
+                    plant = fillers[i]
+                    pid   = plant.id
+                    if pid not in self._plant_points:
+                        self._plant_points[pid] = {
+                            "plant_name": plant.name,
+                            "spread_m":   round(size, 2),
+                            "radius_m":   round(r, 4),
+                            "coords":     [],
+                        }
+                    self._plant_points[pid]["coords"].append([round(x, 4), round(y, 4)])
+                    k_new = len(existing)
+                    existing.append((x, y, r))
+                    buckets.setdefault(_bucket_of(x, y), []).append(k_new)
+                    idx     = (i + 1) % n
+                    x      += size
+                    placed  = True
+                    break
                 if not placed:
                     x += step
             y += step
@@ -531,37 +593,48 @@ class FieldLayout:
         plt.close(fig)
         return out_path
 
-    def pack_plants_in_row(self, plants: list[Plant], row_index: int) -> None:
+    def pack_plants_in_row(
+        self,
+        plants: list[Plant],
+        row_index: int,
+        x_start: float = 0.0,
+        x_end: float | None = None,
+    ) -> None:
         """
-        Pack `plants` into the plant row identified by `row_index`.
+        Pack `plants` into the plant row identified by `row_index`, optionally
+        restricted to the horizontal sub-section `[x_start, x_end]`. The default
+        range is the whole row.
 
         Plants are drawn as circles whose diameter equals `plant.spread / 100` (m).
         They are cycled left-to-right, stacking columns top-to-bottom within the
-        ROW_HEIGHT band until the row is full or no remaining plant fits.
+        ROW_HEIGHT band until the section is full or no remaining plant fits.
         Each placement is appended to `self._plant_points` (one MultiPoint per
         species, keyed by `plant.id`).
         """
         if not plants or not (0 <= row_index < len(self._row_metadata)):
             return
 
+        if x_end is None:
+            x_end = self.field_length
+
         y_bottom = self._row_metadata[row_index]["y_bottom"]
         sizes    = [p.spread / 100 for p in plants]
         n        = len(plants)
 
-        idx, x = 0, 0.0
-        while x < self.field_length:
+        idx, x = 0, x_start
+        while x < x_end:
             col_y, col_width = 0.0, 0.0
             # Stack a column. For each placement, scan the species cycle for the
             # first one that fits both vertically (col_y + size ≤ ROW_HEIGHT) and
-            # horizontally (x + size ≤ field_length). Skipping oversized species
-            # is what lets the row keep packing past plants like Watermelon (3 m)
+            # horizontally (x + size ≤ x_end). Skipping oversized species is what
+            # lets the section keep packing past plants like Watermelon (3 m)
             # whose spread exceeds ROW_HEIGHT (2 m).
             while True:
                 placed = False
                 for offset in range(n):
                     i    = (idx + offset) % n
                     size = sizes[i]
-                    if col_y + size <= ROW_HEIGHT and x + size <= self.field_length:
+                    if col_y + size <= ROW_HEIGHT and x + size <= x_end:
                         plant = plants[i]
                         r  = size / 2
                         cx = x + r
@@ -585,6 +658,139 @@ class FieldLayout:
             if col_width == 0:
                 break  # no species fits at all at this x — close the row
             x += col_width
+
+    # ── tree-row packing ──────────────────────────────────────────────────────
+
+    def pack_plants_in_trees_rows(self) -> None:
+        """
+        Pack every tree row and every row directly above or below a tree row
+        with companions of the trees that flank or border them — mirrors the
+        v1 logic from `field_layout.py:_pack_tree_row` /
+        `_pack_adjacent_tree_row`.
+
+        - Tree rows: x-gaps between trees are packed with the union of the
+          flanking trees' companion non-tree plants, padded with their non-
+          antagonistic plants and filtered for each gap's antagonisms.
+        - Adjacent rows: split into one section per neighbouring tree (bounds
+          at the midpoints between tree edges) and each section is packed
+          with that tree's `companion_groups` plants.
+        """
+        for meta in self._row_metadata:
+            ri = meta["row_index"]
+            if meta["is_tree_row"]:
+                self._pack_tree_row(ri)
+            elif meta["is_above_tree_row"] or meta["is_below_tree_row"]:
+                self._pack_adjacent_tree_row(ri)
+
+    def _pack_tree_row(self, row_index: int) -> None:
+        """Pack the gaps between trees in a tree row with the flanking trees' companions."""
+        placements = sorted(self._tree_placements.get(row_index, []), key=lambda t: t[0])
+        if not placements:
+            return
+
+        # Build gap list: (gap_start, gap_end, left_tree_or_None, right_tree_or_None)
+        gaps: list[tuple[float, float, object, object]] = []
+        fx, fr, ft = placements[0]
+        if fx - fr > 1e-6:
+            gaps.append((0.0, fx - fr, None, ft))
+        for i in range(len(placements) - 1):
+            lx, lr, lt = placements[i]
+            rx, rr, rt = placements[i + 1]
+            gs, ge = lx + lr, rx - rr
+            if ge - gs > 1e-6:
+                gaps.append((gs, ge, lt, rt))
+        lx, lr, lt = placements[-1]
+        if self.field_length - (lx + lr) > 1e-6:
+            gaps.append((lx + lr, self.field_length, lt, None))
+
+        for gap_start, gap_end, left_tree, right_tree in gaps:
+            fillers = self._build_gap_fillers(left_tree, right_tree)
+            if not fillers:
+                continue
+            self.pack_plants_in_row(fillers, row_index, x_start=gap_start, x_end=gap_end)
+
+    def _pack_adjacent_tree_row(self, row_index: int) -> None:
+        """
+        Pack a row directly above or below a tree row. The row is divided
+        into one section per tree in the neighbouring tree row, and each
+        section is packed with that tree's `companion_groups` plants.
+        """
+        meta = self._row_metadata[row_index]
+        tree_row_index = (row_index + 1) if meta["is_above_tree_row"] else (row_index - 1)
+
+        placements = sorted(self._tree_placements.get(tree_row_index, []), key=lambda t: t[0])
+        if not placements:
+            return
+
+        n = len(placements)
+        for i, (x, r, tree) in enumerate(placements):
+            left = (
+                0.0 if i == 0
+                else (placements[i - 1][0] + placements[i - 1][1] + x - r) / 2
+            )
+            right = (
+                self.field_length if i == n - 1
+                else (x + r + placements[i + 1][0] - placements[i + 1][1]) / 2
+            )
+            if not getattr(tree, "companion_groups", None) or right - left <= 0:
+                continue
+            main = [
+                p for g in tree.companion_groups for p in g.plants
+                if p.spread / 100 <= ROW_HEIGHT
+            ]
+            if not main:
+                continue
+            self.pack_plants_in_row(main, row_index, x_start=left, x_end=right)
+
+    def _build_gap_fillers(self, left_tree, right_tree) -> list:
+        """
+        Build the plant list for an x-gap between two trees in a tree row.
+        Prefers `companion_non_tree_plants` of either bordering tree; pads
+        with `non_antagonistic_plants` if fewer than 6 candidates. Filters
+        out plants antagonistic (in either direction) to either bordering
+        tree or to any candidate already chosen. Returns the result sorted
+        smallest-first and limited to species whose spread fits ROW_HEIGHT.
+        """
+        def ant_ids(plant):
+            return {a.id for a in plant.antagonistic_plants}
+
+        tree_ant_ids: set[int] = set()
+        for tree in (left_tree, right_tree):
+            if tree:
+                tree_ant_ids |= ant_ids(tree)
+
+        candidates: list = []
+        seen_ids:   set  = set()
+
+        def _try_add(p) -> bool:
+            if p.id in seen_ids or p.id in tree_ant_ids:
+                return False
+            existing_ids = {c.id for c in candidates}
+            if ant_ids(p) & existing_ids:
+                return False
+            if p.id in {a.id for c in candidates for a in c.antagonistic_plants}:
+                return False
+            candidates.append(p)
+            seen_ids.add(p.id)
+            return True
+
+        for tree in (left_tree, right_tree):
+            if tree:
+                for p in getattr(tree, "companion_non_tree_plants", []) or []:
+                    _try_add(p)
+
+        if len(candidates) < 6:
+            for tree in (left_tree, right_tree):
+                if tree:
+                    for p in getattr(tree, "non_antagonistic_plants", []) or []:
+                        if len(candidates) >= 6:
+                            break
+                        _try_add(p)
+
+        return [
+            p for p in sorted(candidates, key=lambda p: p.spread)
+            if p.spread / 100 <= ROW_HEIGHT
+        ]
 
     # ── plant row backgrounds ─────────────────────────────────────────────────
 
@@ -700,6 +906,7 @@ class FieldLayout:
                 "center_y": round(centre_y, 4),
                 "radius_m": round(radius, 4),
             })
+            self._tree_placements.setdefault(plant_row, []).append((x, radius, tree))
 
             tree_index += 1
             next_radius = (self.trees[tree_index % len(self.trees)].spread / 100) / 2
