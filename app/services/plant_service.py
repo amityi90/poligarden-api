@@ -14,12 +14,14 @@ class PlantService:
         db = get_db()
 
         # 1. All plants
-        plant_rows = db.table("plants").select("*").execute().data
+        plant_rows = db.table("plants").select("*").order("id").execute().data
 
         # 2. All companion links with the related plant's full data
         companion_rows = (
             db.table("companion_plants")
             .select("plant_id, companion:companion_plant_id(*)")
+            .order("plant_id")
+            .order("companion_plant_id")
             .execute()
             .data
         )
@@ -28,6 +30,8 @@ class PlantService:
         antagonist_rows = (
             db.table("antagonistic_plants")
             .select("plant_id, antagonist:antagonistic_plant_id(*)")
+            .order("plant_id")
+            .order("antagonistic_plant_id")
             .execute()
             .data
         )

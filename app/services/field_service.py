@@ -17,6 +17,7 @@ class FieldService:
             db.table("plants")
             .select("*")
             .in_("id", plant_ids)
+            .order("id")
             .execute()
             .data
         )
@@ -25,6 +26,8 @@ class FieldService:
             db.table("companion_plants")
             .select("plant_id, companion:companion_plant_id(*)")
             .in_("plant_id", plant_ids)
+            .order("plant_id")
+            .order("companion_plant_id")
             .execute()
             .data
         )
@@ -33,6 +36,8 @@ class FieldService:
             db.table("antagonistic_plants")
             .select("plant_id, antagonist:antagonistic_plant_id(*)")
             .in_("plant_id", plant_ids)
+            .order("plant_id")
+            .order("antagonistic_plant_id")
             .execute()
             .data
         )
