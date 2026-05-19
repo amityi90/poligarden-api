@@ -82,7 +82,14 @@ class FieldLayout:
             self._mark_tree_rows()
             self.pack_plants_in_trees_rows()
         self.assign_packed_rows_to_field()
-        self.plot()
+        # NOTE: self.plot() (the matplotlib debug renderer below) used to be
+        # called here on every build. It iterates `ax.add_patch(Circle(...))`
+        # per plant placement, which is O(N) but with a huge matplotlib
+        # constant — a 200×200 m field accumulates hundreds of thousands of
+        # placements and the call alone consumed 1+ GB of RAM and 20+ minutes
+        # of wall time. The production PDF renderer in app/routes/pdf.py uses
+        # EllipseCollection (one draw call) and is fast. plot() stays in the
+        # file for ad-hoc dev inspection — call it manually when needed.
         return self
 
     def to_geojson(self) -> dict:
@@ -189,7 +196,7 @@ class FieldLayout:
 
         return {"type": "FeatureCollection", "features": features}
 
-    def to_geodataframes(self) -> dict[str, gpd.GeoDataFrame]:
+    def to_geodataframes(self, include_plants: bool = False) -> dict[str, gpd.GeoDataFrame]:
         """
         Return a dict of GeoDataFrames, one per geometry kind:
             "field"        – single polygon covering the whole field
@@ -198,6 +205,11 @@ class FieldLayout:
             "shadows"      – shadow area rectangles
             "trees"        – tree circle polygons
             "plants"       – one circle Polygon per packed plant instance
+                             (only when include_plants=True, since each placement
+                             triggers a Shapely Point.buffer(resolution=16) — for
+                             500k placements that adds ~90s to to_geojson and the
+                             gdf is never read on that path. Set True only when
+                             you actually need buffered plant polygons.)
         """
         field_gdf = gpd.GeoDataFrame(
             [{"field_length": self.field_length, "field_width": self.field_width}],
@@ -250,29 +262,31 @@ class FieldLayout:
             })
         trees_gdf = gpd.GeoDataFrame(tree_attrs, geometry=list(self._tree_geoms)) if self._tree_geoms else gpd.GeoDataFrame(columns=["name", "geometry"])
 
-        plant_geoms, plant_attrs = [], []
-        for pid, data in self._plant_points.items():
-            name     = data["plant_name"]
-            spread_m = data["spread_m"]
-            radius_m = data["radius_m"]
-            for cx, cy in data["coords"]:
-                plant_geoms.append(Point(cx, cy).buffer(radius_m, resolution=16))
-                plant_attrs.append({
-                    "plant_id":   pid,
-                    "plant_name": name,
-                    "spread_m":   spread_m,
-                    "radius_m":   radius_m,
-                    "center_x":   cx,
-                    "center_y":   cy,
-                })
-        plants_gdf = (
-            gpd.GeoDataFrame(plant_attrs, geometry=plant_geoms)
-            if plant_geoms
-            else gpd.GeoDataFrame(
-                columns=["plant_id", "plant_name", "spread_m", "radius_m", "center_x", "center_y", "geometry"],
-                geometry="geometry",
+        plants_gdf = None
+        if include_plants:
+            plant_geoms, plant_attrs = [], []
+            for pid, data in self._plant_points.items():
+                name     = data["plant_name"]
+                spread_m = data["spread_m"]
+                radius_m = data["radius_m"]
+                for cx, cy in data["coords"]:
+                    plant_geoms.append(Point(cx, cy).buffer(radius_m, resolution=16))
+                    plant_attrs.append({
+                        "plant_id":   pid,
+                        "plant_name": name,
+                        "spread_m":   spread_m,
+                        "radius_m":   radius_m,
+                        "center_x":   cx,
+                        "center_y":   cy,
+                    })
+            plants_gdf = (
+                gpd.GeoDataFrame(plant_attrs, geometry=plant_geoms)
+                if plant_geoms
+                else gpd.GeoDataFrame(
+                    columns=["plant_id", "plant_name", "spread_m", "radius_m", "center_x", "center_y", "geometry"],
+                    geometry="geometry",
+                )
             )
-        )
 
         return {
             "field":        field_gdf,

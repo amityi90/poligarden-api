@@ -1,3 +1,7 @@
+# NOTE: AWS App Runner has a fixed ~120s per-request timeout and exposes no
+#       knob to raise it (neither in apprunner.yaml, the Console, nor the
+#       UpdateService API as of AWS CLI 2.34.30). Long-running endpoints must
+#       either be made faster or made async (return 202 + poll a job endpoint).
 version: 1.0
 runtime: python311
 build:

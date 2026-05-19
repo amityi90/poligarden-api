@@ -1,5 +1,6 @@
 from __future__ import annotations
 import io
+import os
 
 import matplotlib
 matplotlib.use("Agg")          # non-interactive backend — safe for servers
@@ -129,6 +130,7 @@ def _render_pdf(geojson: dict, field_length: float, field_width: float) -> bytes
                 zorder=zorder,
                 offsets=coords,
                 offset_transform=ax.transData,
+                rasterized=True,              # render plant layer as embedded raster; vector PDF for 500k circles blows past Supabase's 50 MB upload cap.
             )
             ax.add_collection(coll)
             # Label once per species, at the first instance position
@@ -215,7 +217,13 @@ def _render_pdf(geojson: dict, field_length: float, field_width: float) -> bytes
         )
 
     buf = io.BytesIO()
-    fig.savefig(buf, format="pdf", dpi=150, bbox_inches="tight")
+    # Plant layer is rasterized (see EllipseCollection above) to keep the PDF
+    # under Supabase's 50 MB file cap. The savefig DPI sets that raster's
+    # resolution — 150 looks pixelated on big fields. Default 600 gives
+    # print-quality output; override via POLYGARDEN_PDF_DPI for higher (900,
+    # 1200) or lower (150 for fast/draft).
+    pdf_dpi = int(os.environ.get("POLYGARDEN_PDF_DPI", "600"))
+    fig.savefig(buf, format="pdf", dpi=pdf_dpi, bbox_inches="tight")
     plt.close(fig)
     buf.seek(0)
     return buf.read()
