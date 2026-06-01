@@ -3,6 +3,7 @@ from .routes.plants import plants_bp
 from .routes.pv import pv_bp
 from .routes.field import field_bp
 from .routes.pdf import pdf_bp
+from .routes.garden import garden_bp
 
 
 def create_app():
@@ -26,5 +27,6 @@ def create_app():
     app.register_blueprint(pv_bp)
     app.register_blueprint(field_bp)
     app.register_blueprint(pdf_bp)
+    app.register_blueprint(garden_bp)
 
     return app

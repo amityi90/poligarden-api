@@ -33,6 +33,17 @@ def mark_done(job_id: str, result: dict) -> None:
     ).eq("id", job_id).execute()
 
 
+def update_partial(job_id: str, result: dict) -> None:
+    """Write an in-progress (partial) result while keeping status='running'.
+    Used by the garden job to stream geometry to the UI as it packs. For a
+    <=20x20 garden the partial GeoJSON is small, so this stays well under the
+    payload size that motivated returning='minimal' for the field job."""
+    get_db().table("jobs").update(
+        {"result": result, "updated_at": _now_iso()},
+        returning="minimal",
+    ).eq("id", job_id).execute()
+
+
 def mark_failed(job_id: str, error: str) -> None:
     get_db().table("jobs").update(
         {"status": "failed", "error": error, "updated_at": _now_iso()},

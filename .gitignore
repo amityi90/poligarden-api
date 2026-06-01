@@ -28,3 +28,6 @@ Thumbs.db
 # Local install artifacts
 *.msi
 install.cmd
+
+# Leaked Windows temp dumps (e.g. UsersamityAppDataLocalTempplants.json)
+Usersamity*Temp*.json
