@@ -100,7 +100,7 @@ def _run_garden_job(job_id: str, data: dict) -> None:
         _log(job_id, f"placed_species={len(geojson['features'])} build={time.perf_counter() - t_total:.2f}s")
 
         t = time.perf_counter()
-        pdf_bytes = _render_pdf(geojson, field_length, field_width)
+        pdf_bytes = _render_pdf(geojson, field_length, field_width, scale=10)
         geojson["pdf_path"] = pdf_storage.upload_pdf(job_id, pdf_bytes)
         _log(job_id, f"pdf={time.perf_counter() - t:.2f}s")
 

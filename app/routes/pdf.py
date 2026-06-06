@@ -33,6 +33,15 @@ _PALETTE = [
     "#aaffc3", "#808000", "#ffd8b1", "#000075", "#a9a9a9",
 ]
 
+# ── True-scale rendering ──────────────────────────────────────────────────────
+# The field axes are pinned to an exact physical size so the PDF prints to scale:
+#   field SCALE=100 → 1 cm on paper = 1 m  |  garden SCALE=10 → 1 cm = 10 cm.
+CM_PER_IN     = 2.54
+MAX_PAPER_IN  = 120.0   # ~3 m — clamp so a huge field can't blow past Agg / file limits
+MAX_RASTER_PX = 12000   # cap the rasterized plant layer's longest side (memory + 50 MB cap)
+MIN_LABEL_PT  = 3.5     # skip a plant's name if it can't render at least this legibly
+MAX_LABEL_PT  = 10.0    # cap so big trees don't get oversized text
+
 
 def _assign_colors(names: list[str]) -> dict[str, str]:
     unique = sorted(set(names))
@@ -47,7 +56,7 @@ def _contrasting_text(hex_color: str) -> str:
     return "black" if luminance > 0.5 else "white"
 
 
-def _render_pdf(geojson: dict, field_length: float, field_width: float) -> bytes:
+def _render_pdf(geojson: dict, field_length: float, field_width: float, scale: int = 100) -> bytes:
     features = geojson["features"]
 
     # Collect all plant + tree names for a unified color map
@@ -62,16 +71,33 @@ def _render_pdf(geojson: dict, field_length: float, field_width: float) -> bytes
 
 
 
-    # ── figure layout ─────────────────────────────────────────────────────────
-    aspect = field_length / max(field_width, 0.001)
-    fig_h  = 10.0
-    fig_w  = min(fig_h * aspect, 18.0) + 3.5
+    # ── figure layout (pinned to scale) ───────────────────────────────────────
+    # Field axes are sized to an exact physical extent so the print is to scale:
+    #   paper_cm = field_m * 100 / scale  →  inches = paper_cm / 2.54
+    field_w_in = field_length * 100.0 / scale / CM_PER_IN
+    field_h_in = field_width  * 100.0 / scale / CM_PER_IN
 
-    fig, (ax, ax_leg) = plt.subplots(
-        1, 2,
-        figsize=(fig_w, fig_h),
-        gridspec_kw={"width_ratios": [fig_w - 3.5, 3.5]},
-    )
+    # Clamp absurdly large paper (keeps Agg/file sane); scale is no longer exact
+    # past this point, so warn.
+    longest = max(field_w_in, field_h_in, 1e-6)
+    if longest > MAX_PAPER_IN:
+        shrink     = MAX_PAPER_IN / longest
+        field_w_in *= shrink
+        field_h_in *= shrink
+        print(f"[pdf] paper clamped: requested 1:{scale} exceeds {MAX_PAPER_IN}in "
+              f"({field_length}x{field_width}m); scaled down by {shrink:.3f}", flush=True)
+
+    # Fixed inch margins for ticks/title + a legend column on the right.
+    M_LEFT, M_BOTTOM, M_TOP, M_RIGHT = 0.9, 0.7, 0.6, 0.2
+    LEG_GAP, LEG_W = 0.3, 3.0
+    total_w = M_LEFT + field_w_in + LEG_GAP + LEG_W + M_RIGHT
+    total_h = M_BOTTOM + field_h_in + M_TOP
+
+    fig    = plt.figure(figsize=(total_w, total_h))
+    ax     = fig.add_axes([M_LEFT / total_w, M_BOTTOM / total_h,
+                           field_w_in / total_w, field_h_in / total_h])
+    ax_leg = fig.add_axes([(M_LEFT + field_w_in + LEG_GAP) / total_w, M_BOTTOM / total_h,
+                           LEG_W / total_w, field_h_in / total_h])
 
     # ── field axes ────────────────────────────────────────────────────────────
     ax.set_xlim(0, field_length)
@@ -79,7 +105,7 @@ def _render_pdf(geojson: dict, field_length: float, field_width: float) -> bytes
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("East → (m)", fontsize=9)
     ax.set_ylabel("North → (m)", fontsize=9)
-    ax.set_title("PolyGarden Field Layout", fontsize=11, fontweight="bold", pad=10)
+    ax.set_title(f"PolyGarden Layout (1:{scale})", fontsize=11, fontweight="bold", pad=10)
     ax.tick_params(labelsize=7)
 
     # ── draw features ─────────────────────────────────────────────────────────
@@ -133,10 +159,11 @@ def _render_pdf(geojson: dict, field_length: float, field_width: float) -> bytes
                 rasterized=True,              # render plant layer as embedded raster; vector PDF for 500k circles blows past Supabase's 50 MB upload cap.
             )
             ax.add_collection(coll)
-            # Label once per species, at the first instance position
+            # Label EVERY plant; the second pass auto-sizes each to its circle and
+            # silently drops any too small to be legible (MIN_LABEL_PT).
             if name and color:
-                cx, cy = coords[0]
-                pending_labels.append((cx, cy, radius_data, name, color, zorder))
+                for cx, cy in coords:
+                    pending_labels.append((cx, cy, radius_data, name, color, zorder))
         else:
             coords = geom["coordinates"][0]
             patch  = MplPolygon(
@@ -186,11 +213,14 @@ def _render_pdf(geojson: dict, field_length: float, field_width: float) -> bytes
         labelspacing=0.5,
     )
 
-    # ── export ────────────────────────────────────────────────────────────────
-    plt.tight_layout(pad=1.5)
-    fig.canvas.draw()   # finalise transforms so transData is accurate
+    # ── per-plant labels ──────────────────────────────────────────────────────
+    # Axes are already pinned by add_axes() (no tight_layout — it would override
+    # the position and break the scale). Draw once so transData is finalised.
+    fig.canvas.draw()
 
-    # Second pass: add text labels with font sizes derived from actual pixel radius
+    # Second pass: each name auto-sized to fit its circle. A circle too small to
+    # show legible text is skipped (not stamped with sub-pt noise) — this is what
+    # keeps a dense field's PDF small while still naming every legible plant.
     for cx, cy, radius_data, name, color, zorder in pending_labels:
         # Convert radius from data units → display pixels → points
         p0 = ax.transData.transform((cx,              cy))
@@ -200,12 +230,13 @@ def _render_pdf(geojson: dict, field_length: float, field_width: float) -> bytes
 
         # Font must fit both vertically and horizontally inside the circle.
         # Approximate character width ≈ 0.55 × font size (points).
-        max_fs = min(
+        fontsize = min(
             diam_pts * 0.70,                       # fit vertically (70 % of diameter)
             diam_pts / (len(name) * 0.55 + 0.1),  # fit horizontally
-            7.0,                                   # hard cap — never huge
+            MAX_LABEL_PT,                          # cap — never huge
         )
-        fontsize = max(1.5, max_fs)
+        if fontsize < MIN_LABEL_PT:
+            continue                               # too small to read → skip (legend covers it)
 
         ax.text(
             cx, cy, name,
@@ -219,11 +250,13 @@ def _render_pdf(geojson: dict, field_length: float, field_width: float) -> bytes
     buf = io.BytesIO()
     # Plant layer is rasterized (see EllipseCollection above) to keep the PDF
     # under Supabase's 50 MB file cap. The savefig DPI sets that raster's
-    # resolution — 150 looks pixelated on big fields. Default 600 gives
-    # print-quality output; override via POLYGARDEN_PDF_DPI for higher (900,
-    # 1200) or lower (150 for fast/draft).
+    # resolution. Default 600 is print-quality; override via POLYGARDEN_PDF_DPI.
+    # At true scale the paper can be large, so cap the DPI to bound the raster's
+    # longest side to MAX_RASTER_PX (memory + file size).
     pdf_dpi = int(os.environ.get("POLYGARDEN_PDF_DPI", "600"))
-    fig.savefig(buf, format="pdf", dpi=pdf_dpi, bbox_inches="tight")
+    pdf_dpi = max(72, min(pdf_dpi, int(MAX_RASTER_PX / max(field_w_in, field_h_in, 1e-6))))
+    # No bbox_inches="tight": it re-crops and would change the printed scale.
+    fig.savefig(buf, format="pdf", dpi=pdf_dpi)
     plt.close(fig)
     buf.seek(0)
     return buf.read()
