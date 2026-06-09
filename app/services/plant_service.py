@@ -1,4 +1,4 @@
-from app.db import get_db
+from app.plants_db import plants_cursor, fetch_relations
 from app.models.plant import Plant
 
 
@@ -7,49 +7,26 @@ class PlantService:
     @staticmethod
     def get_all() -> list[Plant]:
         """
-        Fetch all plants from the DB and attach their companion and
-        antagonistic plant lists. Uses 3 flat queries joined in Python
-        to avoid the N+1 problem.
+        Fetch all plants and attach their companion and antagonistic plant lists.
+        Three flat queries joined in Python to avoid the N+1 problem — same shape
+        as before, only the source changed: companions/antagonists now come from
+        the single `plant_relations` table (is_companion = true / false).
         """
-        db = get_db()
+        with plants_cursor() as cur:
+            cur.execute("SELECT * FROM plants WHERE approved ORDER BY id")
+            plant_rows = cur.fetchall()
 
-        # 1. All plants
-        plant_rows = db.table("plants").select("*").order("id").execute().data
+            companion_rows  = fetch_relations(cur, True)    # is_companion = true
+            antagonist_rows = fetch_relations(cur, False)   # is_companion = false
 
-        # 2. All companion links with the related plant's full data
-        companion_rows = (
-            db.table("companion_plants")
-            .select("plant_id, companion:companion_plant_id(*)")
-            .order("plant_id")
-            .order("companion_plant_id")
-            .execute()
-            .data
-        )
-
-        # 3. All antagonist links with the related plant's full data
-        antagonist_rows = (
-            db.table("antagonistic_plants")
-            .select("plant_id, antagonist:antagonistic_plant_id(*)")
-            .order("plant_id")
-            .order("antagonistic_plant_id")
-            .execute()
-            .data
-        )
-
-        # Build relation maps  { plant_id -> [Plant, ...] }
+        # Build relation maps  { owner_plant_id -> [Plant, ...] }
         companions_map: dict[int, list[Plant]] = {}
         for row in companion_rows:
-            pid = row["plant_id"]
-            companions_map.setdefault(pid, []).append(
-                Plant.from_db_row(row["companion"])
-            )
+            companions_map.setdefault(row["owner_id"], []).append(Plant.from_db_row(row))
 
         antagonists_map: dict[int, list[Plant]] = {}
         for row in antagonist_rows:
-            pid = row["plant_id"]
-            antagonists_map.setdefault(pid, []).append(
-                Plant.from_db_row(row["antagonist"])
-            )
+            antagonists_map.setdefault(row["owner_id"], []).append(Plant.from_db_row(row))
 
         # Assemble final Plant objects with relations attached
         plants: list[Plant] = []

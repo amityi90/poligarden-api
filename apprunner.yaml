@@ -17,6 +17,9 @@ run:
   network:
     port: 8080
     env: PORT
+  secrets:
+    - name: PLANTS_DATABASE_URL
+      value-from: "arn:aws:secretsmanager:us-east-1:730335487266:secret:polygarden/plants-database-url-6CZ7xf"
   env:
     - name: SUPABASE_URL
       value: "https://jfqtyxrbqolzbvglqnno.supabase.co"

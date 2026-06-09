@@ -1,4 +1,4 @@
-from app.db import get_db
+from app.plants_db import plants_cursor, fetch_relations
 from app.models.plant import Plant
 from app.models.tree import Tree
 from app.models.companion_group import CompanionGroup
@@ -10,51 +10,23 @@ class FieldService:
 
     @staticmethod
     def get_plants_by_ids(plant_ids: list[int]) -> list[Plant]:
-        """Fetch the chosen plants from DB by their IDs."""
-        db = get_db()
+        """Fetch the chosen plants by their IDs and attach companion/antagonist
+        lists. Same shape as before; relations now come from the single
+        `plant_relations` table (is_companion = true / false)."""
+        with plants_cursor() as cur:
+            cur.execute("SELECT * FROM plants WHERE approved AND id = ANY(%s) ORDER BY id", (plant_ids,))
+            plant_rows = cur.fetchall()
 
-        plant_rows = (
-            db.table("plants")
-            .select("*")
-            .in_("id", plant_ids)
-            .order("id")
-            .execute()
-            .data
-        )
-
-        companion_rows = (
-            db.table("companion_plants")
-            .select("plant_id, companion:companion_plant_id(*)")
-            .in_("plant_id", plant_ids)
-            .order("plant_id")
-            .order("companion_plant_id")
-            .execute()
-            .data
-        )
-
-        antagonist_rows = (
-            db.table("antagonistic_plants")
-            .select("plant_id, antagonist:antagonistic_plant_id(*)")
-            .in_("plant_id", plant_ids)
-            .order("plant_id")
-            .order("antagonistic_plant_id")
-            .execute()
-            .data
-        )
+            companion_rows  = fetch_relations(cur, True, plant_ids)
+            antagonist_rows = fetch_relations(cur, False, plant_ids)
 
         companions_map: dict[int, list[Plant]] = {}
         for row in companion_rows:
-            pid = row["plant_id"]
-            companions_map.setdefault(pid, []).append(
-                Plant.from_db_row(row["companion"])
-            )
+            companions_map.setdefault(row["owner_id"], []).append(Plant.from_db_row(row))
 
         antagonists_map: dict[int, list[Plant]] = {}
         for row in antagonist_rows:
-            pid = row["plant_id"]
-            antagonists_map.setdefault(pid, []).append(
-                Plant.from_db_row(row["antagonist"])
-            )
+            antagonists_map.setdefault(row["owner_id"], []).append(Plant.from_db_row(row))
 
         plants: list[Plant] = []
         for row in plant_rows:
