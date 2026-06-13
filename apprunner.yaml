@@ -18,12 +18,20 @@ run:
     port: 8080
     env: PORT
   secrets:
-    - name: PLANTS_DATABASE_URL
-      value-from: "arn:aws:secretsmanager:us-east-1:730335487266:secret:polygarden/plants-database-url-6CZ7xf"
+    - name: GCP_SA_KEY
+      value-from: "arn:aws:secretsmanager:us-east-1:730335487266:secret:polygarden/gcp-sa-key-zUwqBT"
+    - name: PLANTS_DB_PASS
+      value-from: "arn:aws:secretsmanager:us-east-1:730335487266:secret:polygarden/plants-db-pass-p7kPyB"
   env:
     - name: SUPABASE_URL
       value: "https://jfqtyxrbqolzbvglqnno.supabase.co"
     - name: SUPABASE_KEY
       value: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpmcXR5eHJicW9semJ2Z2xxbm5vIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUyMzA3NzIsImV4cCI6MjA5MDgwNjc3Mn0.IA_iEaEtqEhmalwGg1ourzVtn9RnhJtW743XV1kRGgQ"
+    - name: PLANTS_INSTANCE_CONN
+      value: "plants-data-api-543316:europe-west3:plants-db"
+    - name: PLANTS_DB_USER
+      value: "plants_user"
+    - name: PLANTS_DB_NAME
+      value: "plants_data"
     - name: PYTHONPATH
       value: "/app"

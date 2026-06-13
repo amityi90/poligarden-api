@@ -31,3 +31,4 @@ install.cmd
 
 # Leaked Windows temp dumps (e.g. UsersamityAppDataLocalTempplants.json)
 Usersamity*Temp*.json
+seed.sql
